@@ -29,6 +29,5 @@ python mail.py send --to all --subject "..." --body-file body.md
 
 ## Known limits
 
-- Two machines sending to the same inbox in the same second from different machines would create the same file name on both, and Resilio would keep only one. The `-2` suffix only protects against collisions it can see locally. Rare enough to accept for now; if it ever matters, add the sender to the file name.
 - Mail waits until a session on the recipient machine starts or receives a prompt. An idle open session does not see it until the user types something.
 - The hook uses the Python that ran `install-hook`; if that interpreter moves, run `install-hook` again.

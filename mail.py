@@ -2,7 +2,7 @@
 
 A message for a machine is a Markdown file in that machine's inbox, which Resilio carries to it:
 
-    ResilioSync/Mailbox/<Machine>/<yyMMdd-HHmmss>.md      waiting (unread)
+    ResilioSync/Mailbox/<Machine>/<yyMMdd-HHmmss>-<Sender>.md      waiting (unread)
     ResilioSync/Mailbox/<Machine>/read/<same name>        delivered to a Claude session on <Machine>
 
 Each file starts with a small header (from, to, subject, sent, optional in_reply_to) between two
@@ -75,7 +75,7 @@ def inbox_dir(machine: str) -> Path:
 
 
 def send_order(path: Path) -> tuple:
-    """Oldest first: 260924-040019.md before its same-second sibling 260924-040019-2.md."""
+    """Oldest first by the stamp; within one second, 260924-040019-Mistral.md before its sibling 260924-040019-Mistral-2.md."""
     return (path.name[:13], len(path.name), path.name)
 
 
@@ -112,11 +112,14 @@ def format_message(header: dict, body: str) -> str:
     return "\n".join(lines) + "\n\n" + body.strip() + "\n"
 
 
-def unique_name(folder: Path, stamp: str) -> str:
-    """<stamp>.md, or <stamp>-2.md etc. when that second is already taken in the inbox or in read/."""
+def unique_name(folder: Path, stamp: str, sender: str) -> str:
+    """<stamp>-<sender>.md, or <stamp>-<sender>-2.md etc. when this sender already used that second.
+
+    The sender in the name is what keeps two machines writing to the same inbox in the same second
+    from producing one file name, which Resilio would resolve by keeping only one of them."""
     n = 1
     while True:
-        name = stamp + ("" if n == 1 else "-" + str(n)) + ".md"
+        name = stamp + "-" + sender + ("" if n == 1 else "-" + str(n)) + ".md"
         if not (folder / name).exists() and not (folder / READ_DIR / name).exists():
             return name
         n += 1
@@ -186,7 +189,7 @@ def cmd_send(args, config: dict) -> None:
     for machine in recipients:
         folder = inbox_dir(machine)
         folder.mkdir(parents=True, exist_ok=True)
-        path = folder / unique_name(folder, now.strftime("%y%m%d-%H%M%S"))
+        path = folder / unique_name(folder, now.strftime("%y%m%d-%H%M%S"), sender)
         write_atomically(path, format_message(header, body))
         print("sent " + relative_to_root(path))
 
