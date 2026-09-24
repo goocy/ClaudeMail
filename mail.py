@@ -25,6 +25,8 @@ desktop notification, that mail has arrived, so a session gets opened to receive
 Commands:
     send --to NAME [--to NAME ...] --subject TEXT (--body-file FILE | body on stdin) [--reply-to PATH]
          NAME may be 'all' (every other machine) or Machine/<session id or its first 8+ characters>.
+         A bare machine name is refused while that machine has sessions active within wait_hours; the
+         refusal lists them to pick from. --any sends to the machine inbox anyway (whichever session is first).
          --reply-to fills in to/subject/in_reply_to and addresses the original's sending session.
     sessions [MACHINE] the session folders (all machines, or one), newest first, with what each is about
     inbox [--all]      unread messages for this machine (--all: the read ones too)
@@ -277,10 +279,40 @@ def resolve_message_path(given: str) -> Path:
 
 # ---------------------------------------------------------------- send
 
+def active_sessions(machine: str, config: dict) -> list:
+    """Session folders of machine with activity within wait_hours (a waiter can still be listening), newest first."""
+    horizon = 3600 * float(config.get("wait_hours", 24))
+    folders = [f for f in session_folders(machine) if session_id_of(f) and time.time() - last_activity(f) <= horizon]
+    return sorted(folders, key=last_activity, reverse=True)
+
+
+def refuse_bare_machines(machines: list, config: dict) -> None:
+    """Mail to a bare machine goes to whichever session polls first, often the wrong one (2026-09-24). So while the
+    machine has sessions that may be listening, make the sender pick one; with none, the inbox (and mailroom) is right."""
+    lines = []
+    for machine in dict.fromkeys(machines):
+        folders = active_sessions(machine, config)
+        if not folders:
+            continue
+        lines.append(machine + " has " + str(len(folders)) + " active session" + ("" if len(folders) == 1 else "s")
+                     + "; address one as --to " + machine + "/<id>:")
+        for folder in folders:
+            info = read_info(folder)
+            stamp = datetime.datetime.fromtimestamp(last_activity(folder)).strftime("%Y-%m-%d %H:%M")
+            lines.append("  " + machine + "/" + session_id_of(folder)[:MIN_SESSION_PREFIX] + "  last active " + stamp
+                         + ("  in " + info["cwd"] if info.get("cwd") else ""))
+            if info.get("first_prompt"):
+                lines.append("      \"" + info["first_prompt"][:120] + "\"")
+    if lines:
+        raise SystemExit("\n".join(lines) + "\nPick the session whose work the message concerns. Only if none fits, add --any"
+                         " to leave it in the machine inbox for whichever session takes it first.")
+
+
 def cmd_send(args, config: dict) -> None:
     sender = this_machine(config)
     header = {"from": sender, "from_session": current_session(), "subject": args.subject or ""}
     recipients = []                                   # (machine, session id or prefix, or "" for any session)
+    named_machines = []                               # machines given bare by name, not through 'all' or --reply-to
     if args.reply_to:
         original_path = resolve_message_path(args.reply_to)
         original, _ = parse_message(original_path.read_text(encoding="utf-8"))
@@ -303,7 +335,11 @@ def cmd_send(args, config: dict) -> None:
                 raise SystemExit("Bad session in '" + part.strip() + "': give its id or at least its first "
                                  + str(MIN_SESSION_PREFIX) + " characters (letters, digits, '-').")
             recipients.append((canonical_machine(machine_part, config), session))
+            if not session:
+                named_machines.append(canonical_machine(machine_part, config))
     recipients = list(dict.fromkeys(recipients))
+    if not args.any:
+        refuse_bare_machines([m for m, s in recipients if not s and m in named_machines], config)
     targets = []                                      # (machine, folder, to_session)
     for machine, session in recipients:
         if not session:
@@ -754,6 +790,7 @@ def main() -> None:
     p.add_argument("--subject")
     p.add_argument("--body-file")
     p.add_argument("--reply-to", help="path of the message being answered (absolute, or relative to Mailbox/)")
+    p.add_argument("--any", action="store_true", help="allow a bare machine name that has active sessions")
     p = sub.add_parser("inbox")
     p.add_argument("--all", action="store_true")
     p = sub.add_parser("sessions")
