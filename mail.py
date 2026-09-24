@@ -376,6 +376,9 @@ def edit_settings(add: bool) -> None:
     python = Path(sys.executable)
     if python.name.casefold() == "pythonw.exe":
         python = python.with_name("python.exe")   # a hook needs a console interpreter for its stdout
+    stable_mac_python = Path("/opt/homebrew/bin/python3")
+    if sys.platform == "darwin" and stable_mac_python.is_file():
+        python = stable_mac_python                # survives a Homebrew major upgrade; sys.executable is version-stamped
     command = '"' + python.as_posix() + '" -B "' + SERVICE_DIR.joinpath("mail.py").as_posix() + '" hook'
     hooks = settings.setdefault("hooks", {})
     for event in HOOK_EVENTS:

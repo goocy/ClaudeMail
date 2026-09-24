@@ -24,7 +24,7 @@ python mail.py send --to all --subject "..." --body-file body.md
 ## Setup per machine
 
 - Windows: `powershell -ExecutionPolicy Bypass -File install_task.ps1`, then restart open Claude sessions. It registers the hook and the at-logon task `Claude Mail Watcher`.
-- Mac (Altiplano): `python3 mail.py install-hook`, and run `python3 mail.py watch` from a LaunchAgent (not written yet). If the Mac's hostname is not `altiplano`, add it under `hostnames` in `config.json`.
+- Mac (Altiplano): `./install_launchd.sh` (`./install_launchd.sh uninstall` to remove), then restart open Claude sessions. It registers the hook with the stable `/opt/homebrew/bin/python3` and loads the LaunchAgent `com.goocy.claudemail` (RunAtLoad + KeepAlive), which runs `mail.py watch` through `ClaudeMail.app`. That bundle is a compiled launcher (`launcher.c`, copied from ExportScreenTime) built and ad-hoc signed by `build_app.sh`; it needs no privacy grant, so rebuilding it costs nothing. `logs/launchd.log` only catches tracebacks and wrapper errors. If the Mac's hostname is not `altiplano`, add it under `hostnames` in `config.json`.
 - The machine is identified by hostname (domain part dropped, case ignored), then `config.json` `hostnames`, then the `CLAUDE_MAILBOX_MACHINE` environment variable, which overrides both.
 
 ## Known limits
