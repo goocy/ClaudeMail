@@ -1,0 +1,8 @@
+{
+  "_about": "ClaudeMail settings. 'machines' are the mailbox folder names under ResilioSync/Mailbox, spelled as the folders are. 'hostnames' maps a hostname that is not simply the machine name (compared case-insensitively, domain part dropped) onto one of them; the CLAUDE_MAILBOX_MACHINE environment variable overrides both.",
+  "machines": ["Mistral", "Moosfels", "Stahlwerk", "Teppich", "Altiplano"],
+  "hostnames": {},
+  "poll_seconds": 5,
+  "heartbeat_minutes": 60,
+  "inject_max_chars": 12000
+}
