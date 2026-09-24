@@ -5,5 +5,7 @@
   "poll_seconds": 5,
   "heartbeat_minutes": 60,
   "inject_max_chars": 12000,
-  "wait_hours": 24
+  "wait_hours": 24,
+  "session_fallback_minutes": 10,
+  "session_keep_days": 30
 }
