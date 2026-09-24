@@ -4,5 +4,6 @@
   "hostnames": {},
   "poll_seconds": 5,
   "heartbeat_minutes": 60,
-  "inject_max_chars": 12000
+  "inject_max_chars": 12000,
+  "wait_hours": 24
 }

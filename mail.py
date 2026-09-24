@@ -17,6 +17,7 @@ Commands:
          NAME may be 'all' (every other machine). --reply-to fills in to/subject/in_reply_to.
     inbox [--all]      unread messages for this machine (--all: the read ones too)
     hook               the Claude Code hook (reads the hook JSON on stdin, prints hook JSON)
+    wait               the asyncRewake hook: waits in the background, wakes an idle session with new mail
     watch              poll this machine's inbox, notify on each new message, log to logs/
     install-hook       register the hook in ~/.claude/settings.json (idempotent)
     uninstall-hook     remove it again
@@ -44,6 +45,7 @@ LOG_DIR = SERVICE_DIR / "logs"
 READ_DIR = "read"
 HEADER_FIELDS = ["from", "to", "subject", "sent", "in_reply_to"]
 HOOK_EVENTS = ["SessionStart", "UserPromptSubmit"]
+WAIT_EVENTS = ["SessionStart", "Stop"]          # where the background waiter (asyncRewake) is started
 
 
 def load_config() -> dict:
@@ -275,6 +277,65 @@ def cmd_hook(args, config: dict) -> None:
         pass
 
 
+# ---------------------------------------------------------------- wait
+
+def waiter_dir() -> Path:
+    # Local, never synced: which process is the current waiter of which session on this machine.
+    return Path.home() / ".claude" / "claudemail-waiters"
+
+
+def wait_limit_seconds(config: dict) -> int:
+    return int(3600 * float(config.get("wait_hours", 24)))
+
+
+def cmd_wait(args, config: dict) -> None:
+    """The asyncRewake hook: sit in the background until mail arrives, then wake the idle session with it.
+
+    Claude Code runs this on SessionStart and after every turn (Stop). Exit 2 hands stderr to the session
+    as a new turn; exit 0 wakes nothing. A newer waiter of the same session takes over the pid file and
+    the older one then leaves quietly, so a session never has more than one. The waiter gives up on its
+    own shortly before the hook timeout, so Claude Code never kills it between a claim and its output
+    (which would move a message to read/ without anyone seeing it)."""
+    try:
+        try:
+            hook_input = json.loads(sys.stdin.read() or "{}")
+        except ValueError:
+            hook_input = {}
+        event = str(hook_input.get("hook_event_name", "Stop"))
+        session = "".join(c for c in str(hook_input.get("session_id", "unknown")) if c.isalnum() or c == "-") or "unknown"
+        machine = this_machine(config)
+        poll = float(config.get("poll_seconds", 5))
+        deadline = time.monotonic() + wait_limit_seconds(config) - 120
+        folder = waiter_dir()
+        folder.mkdir(parents=True, exist_ok=True)
+        for old in folder.glob("*.pid"):
+            try:
+                if time.time() - old.stat().st_mtime > wait_limit_seconds(config) + 86400:
+                    old.unlink()
+            except OSError:
+                pass
+        pid_file = folder / (session + ".pid")
+        me = str(os.getpid())
+        pid_file.write_text(me, encoding="utf-8")
+        while time.monotonic() < deadline:
+            try:
+                if pid_file.read_text(encoding="utf-8") != me:
+                    return                                   # a newer waiter took over this session
+            except OSError:
+                return
+            claimed = claim_waiting(machine)
+            if claimed:
+                log(machine, "delivered to a waiting session (" + event + " waiter): " + ", ".join(p.name for p, _ in claimed))
+                sys.stderr.write(delivery_text(machine, claimed, config))
+                sys.stderr.flush()
+                sys.exit(2)
+            time.sleep(poll)
+    except SystemExit:
+        raise
+    except BaseException:
+        pass
+
+
 # ---------------------------------------------------------------- watch
 
 def log(machine: str, message: str) -> None:
@@ -382,12 +443,18 @@ def edit_settings(add: bool) -> None:
     stable_mac_python = Path("/opt/homebrew/bin/python3")
     if sys.platform == "darwin" and stable_mac_python.is_file():
         python = stable_mac_python                # survives a Homebrew major upgrade; sys.executable is version-stamped
-    command = '"' + python.as_posix() + '" -B "' + SERVICE_DIR.joinpath("mail.py").as_posix() + '" hook'
+    base = '"' + python.as_posix() + '" -B "' + SERVICE_DIR.joinpath("mail.py").as_posix() + '" '
+    command = base + "hook"
+    wait_command = base + "wait"
+    config = load_config()
     hooks = settings.setdefault("hooks", {})
-    for event in HOOK_EVENTS:
+    for event in list(dict.fromkeys(HOOK_EVENTS + WAIT_EVENTS)):
         entries = [e for e in hooks.get(event, []) if not is_our_hook(e)]
-        if add:
+        if add and event in HOOK_EVENTS:
             entries.append({"hooks": [{"type": "command", "command": command, "timeout": 15}]})
+        if add and event in WAIT_EVENTS:
+            entries.append({"hooks": [{"type": "command", "command": wait_command, "asyncRewake": True,
+                                       "timeout": wait_limit_seconds(config)}]})
         if entries:
             hooks[event] = entries
         else:
@@ -396,9 +463,11 @@ def edit_settings(add: bool) -> None:
         settings.pop("hooks")
     path.parent.mkdir(exist_ok=True)
     write_atomically(path, json.dumps(settings, indent=2) + "\n")
-    print(("registered" if add else "removed") + " ClaudeMail hook for " + ", ".join(HOOK_EVENTS) + " in " + str(path))
+    print(("registered" if add else "removed") + " ClaudeMail hook for " + ", ".join(HOOK_EVENTS)
+          + " and the waiting hook for " + ", ".join(WAIT_EVENTS) + " in " + str(path))
     if add:
         print("command: " + command)
+        print("waiter:  " + wait_command + "  (asyncRewake)")
 
 
 def main() -> None:
@@ -411,7 +480,7 @@ def main() -> None:
     p.add_argument("--reply-to", help="path of the message being answered (absolute, or relative to Mailbox/)")
     p = sub.add_parser("inbox")
     p.add_argument("--all", action="store_true")
-    for name in ["hook", "watch", "install-hook", "uninstall-hook", "whoami"]:
+    for name in ["hook", "wait", "watch", "install-hook", "uninstall-hook", "whoami"]:
         sub.add_parser(name)
     args = parser.parse_args()
     config = load_config()
@@ -421,6 +490,8 @@ def main() -> None:
         cmd_inbox(args, config)
     elif args.command == "hook":
         cmd_hook(args, config)
+    elif args.command == "wait":
+        cmd_wait(args, config)
     elif args.command == "watch":
         cmd_watch(args, config)
     elif args.command == "install-hook":
