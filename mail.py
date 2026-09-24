@@ -17,8 +17,9 @@ SessionStart and on every UserPromptSubmit, `mail.py hook` moves any waiting mes
 session (its own folder, then the machine inbox) into read/ and hands their text to it as context.
 The move is the claim, so with several sessions open each message reaches exactly one of them.
 `send` records the sending session (CLAUDE_CODE_SESSION_ID), and a reply goes to that session's
-folder. Mail for a session that is no longer listening (neither its Claude process nor its waiter
-alive, and not seen for session_fallback_minutes) is moved to the machine inbox by any hook, waiter
+folder. Mail for a session that is no longer listening (no waiter running, not in a turn, and not
+seen for session_fallback_minutes; a session the desktop app reopened counts as not listening until
+its next turn) is moved to the machine inbox by any hook, waiter
 or watcher on that machine. `mail.py watch` is the per-machine watcher: it tells the human, with a
 desktop notification, that mail has arrived, so a session gets opened to receive it.
 
@@ -484,6 +485,7 @@ def cmd_hook(args, config: dict) -> None:
         session = clean_session(hook_input.get("session_id")) or current_session()
         machine = this_machine(config)
         register_session(session)
+        set_busy(session, event == "UserPromptSubmit")   # SessionStart: idle (a reopened session is deaf until prompted)
         ensure_session_folder(machine, session, hook_input)
         sweep_sessions(machine, config)
         if event == "SessionStart":
@@ -548,9 +550,28 @@ def pid_alive(pid: int) -> bool:
     return True
 
 
+def set_busy(session: str, busy: bool) -> None:
+    """<session>.busy (local) marks a turn in progress: its Stop waiter will start when the turn ends. A session the
+    desktop app reopens runs SessionStart only and has no waiter until its next turn, so it must not look busy."""
+    if not session or session == "unknown":
+        return
+    path = waiter_dir() / (session + ".busy")
+    try:
+        if busy:
+            path.parent.mkdir(parents=True, exist_ok=True)
+            path.write_text("", encoding="utf-8")
+        else:
+            path.unlink()
+    except OSError:
+        pass
+
+
 def session_alive(name: str, config: dict) -> bool:
-    """Whether the session a folder is addressed to (full id or prefix) is still listening on this machine:
-    its Claude process or its waiter is running, or it registered within session_fallback_minutes."""
+    """Whether the session a folder is addressed to (full id or prefix) is still listening on this machine: its
+    waiter is running, it is in a turn (busy) while its Claude process runs, or it registered within
+    session_fallback_minutes. A live Claude process alone is not enough: after the desktop app restarts, a reopened
+    session runs only SessionStart, where no waiter may start, and stays deaf until someone prompts it (seen on
+    Stahlwerk 2026-09-24, mail unseen for two hours). Its mail then goes to the machine inbox instead."""
     grace = 60 * float(config.get("session_fallback_minutes", 10))
     folder = waiter_dir()
     if not folder.is_dir():
@@ -560,10 +581,13 @@ def session_alive(name: str, config: dict) -> bool:
             continue
         try:
             text = path.read_text(encoding="utf-8").strip()
-            if text.isdigit() and pid_alive(int(text)):
+            if path.suffix == ".pid" and text.isdigit() and pid_alive(int(text)):
                 return True
-            if path.suffix == ".claude" and time.time() - path.stat().st_mtime < grace:
-                return True
+            if path.suffix == ".claude":
+                if time.time() - path.stat().st_mtime < grace:
+                    return True
+                if text.isdigit() and pid_alive(int(text)) and path.with_suffix(".busy").exists():
+                    return True
         except OSError:
             continue
     return False
@@ -606,13 +630,14 @@ def cmd_wait(args, config: dict) -> None:
         deadline = time.monotonic() + wait_limit_seconds(config) - 120
         folder = waiter_dir()
         folder.mkdir(parents=True, exist_ok=True)
-        for old in list(folder.glob("*.pid")) + list(folder.glob("*.claude")):
+        for old in list(folder.glob("*.pid")) + list(folder.glob("*.claude")) + list(folder.glob("*.busy")):
             try:
                 if time.time() - old.stat().st_mtime > wait_limit_seconds(config) + 86400:
                     old.unlink()
             except OSError:
                 pass
         register_session(session)
+        set_busy(session, False)                     # the turn is over; from here this waiter listens
         try:
             ensure_session_folder(machine, session, hook_input)
         except OSError:
@@ -634,6 +659,7 @@ def cmd_wait(args, config: dict) -> None:
             claimed = claim_waiting(machine, session)
             if claimed:
                 log(machine, "delivered to a waiting session (" + event + " waiter): " + ", ".join(relative_to_root(p) for p, _ in claimed))
+                set_busy(session, True)                  # the wakeup starts a turn; its Stop starts the next waiter
                 sys.stderr.write(delivery_text(machine, claimed, config, session))
                 sys.stderr.flush()
                 sys.exit(2)
