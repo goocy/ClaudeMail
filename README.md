@@ -30,5 +30,5 @@ python mail.py send --to all --subject "..." --body-file body.md
 
 ## Known limits
 
-- Mail waits until a session on the recipient machine starts, receives a prompt, or (with the waiter installed) finishes a turn within the last `wait_hours`. With no Claude session open at all, only the notification tells anyone. The waiter is active only where `install-hook` was run after 2026-09-24 05:10 (Altiplano so far); elsewhere re-run it and restart the sessions.
+- Mail waits until a session on the recipient machine starts, receives a prompt, or (with the waiter installed) finishes a turn within the last `wait_hours`. With no Claude session open at all, only the notification tells anyone. The waiter is active only where `install-hook` was run after 2026-09-24 05:10 (Altiplano and Mistral so far; see `Running-on.md`); elsewhere re-run it and restart the sessions.
 - The hook uses the Python that ran `install-hook`; if that interpreter moves, run `install-hook` again.
