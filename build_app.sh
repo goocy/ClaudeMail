@@ -15,8 +15,8 @@ APP="$DIR/ClaudeMail.app"
 SIGN_ID="${SIGN_ID:--}"
 
 mkdir -p "$APP/Contents/MacOS"
-# Host architecture only. Build on the machine that will run it.
-cc -O2 -Wall -Wextra -o "$APP/Contents/MacOS/claudemail" "$DIR/launcher.c"
+# Universal (arm64 for Altiplano, x86_64 for Sandbank): the one bundle is synced to both Macs.
+cc -O2 -Wall -Wextra -arch arm64 -arch x86_64 -o "$APP/Contents/MacOS/claudemail" "$DIR/launcher.c"
 codesign --force --sign "$SIGN_ID" "$APP"
 codesign --verify --strict "$APP"
 codesign -dvvv "$APP" 2>&1 | grep -E "^(Identifier|Format|Signature|Authority|CDHash)" || true
