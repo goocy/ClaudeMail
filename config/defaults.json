@@ -1,0 +1,13 @@
+{
+  "_about": "ClaudeMail settings shared by every machine. A machine overrides any of them in config/<machine>.json (lower case, e.g. config/stahlwerk.json), which only that machine edits. 'machines' are the mailbox folder names under ResilioSync/Mailbox; 'hostnames' maps a hostname that is not simply the machine name onto one of them (the CLAUDE_MAILBOX_MACHINE environment variable overrides both). wait_hours must match the Stop hook's timeout in settings.json (install-hook writes it).",
+  "machines": ["Mistral", "Moosfels", "Stahlwerk", "Teppich", "Altiplano", "Sandbank"],
+  "hostnames": {"OldHostname": "Sandbank"},
+  "poll_seconds": 5,
+  "nudge_after_minutes": 2,
+  "stale_minutes": 6,
+  "kick_every_minutes": 20,
+  "heartbeat_minutes": 60,
+  "inject_max_chars": 12000,
+  "wait_hours": 24,
+  "session_keep_days": 30
+}

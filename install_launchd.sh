@@ -26,7 +26,7 @@ if [[ "${1:-}" == "uninstall" ]]; then
     exit 0
 fi
 
-# Fails loudly if this hostname is not one of the mailbox machines in config.json.
+# Fails loudly if this hostname is not one of the mailbox machines in config/defaults.json.
 "$PYTHON" -B "$DIR/mail.py" whoami
 "$PYTHON" -B "$DIR/mail.py" install-hook
 
@@ -73,4 +73,4 @@ launchctl bootstrap "gui/$(id -u)" "$PLIST"
 echo "Installed and loaded LaunchAgent $LABEL."
 echo "Runs : $WRAPPER -B $DIR/mail.py watch"
 echo "Log  : $LOGDIR/claudemail.<machine>.<yyMMdd>.log"
-echo "Restart any open Claude sessions so they pick up the hook."
+echo "Next: open one desktop session in ~/ResilioSync/Mailbox/<Machine>/post office and pin it."
