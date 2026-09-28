@@ -214,11 +214,12 @@ def read_report(machine: str) -> dict:
 
 
 def write_report(machine: str, report: dict) -> None:
-    """A new file per report, then drop all but it and the one before it (a reader may be opening that one)."""
+    """A new file per report, then drop all but the newest five. Keeping only two left Mistral with none for a moment on
+    2026-09-28: Resilio can deliver the deletions before the new files, and a reader then sees "not reported since ever"."""
     stamp = datetime.datetime.now()
     path = machine_dir(machine) / REPORTS / (stamp.strftime("%y%m%d-%H%M%S-") + "%03d" % (stamp.microsecond // 1000) + ".json")
     write_json(path, report)
-    for old in report_names(machine)[2:]:
+    for old in report_names(machine)[5:]:
         try:
             old.unlink()
         except OSError:
