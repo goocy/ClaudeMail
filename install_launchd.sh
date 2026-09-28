@@ -1,25 +1,35 @@
 #!/bin/bash
 # Sets up ClaudeMail on this Mac (the counterpart of install_task.ps1):
-#   1. registers the Claude Code hook (SessionStart + UserPromptSubmit) in ~/.claude/settings.json,
-#      which is what actually hands arriving mail to a Claude session;
-#   2. installs the LaunchAgent com.goocy.claudemail, which keeps `mail.py watch` running through
-#      ClaudeMail.app from login on. The watcher only raises a notification per new message.
-# Re-running it cleanly replaces any existing copy.
+#   1. registers the Claude Code hooks in ~/.claude/settings.json: `mail.py hook` on SessionStart + UserPromptSubmit
+#      and `mail.py wait` on Stop (asyncRewake). These commands never change, so code updates need no re-run;
+#   2. installs and starts the LaunchAgent com.goocy.claudemail, which keeps `mail.py watch` (the dispatcher's
+#      keeper) running through ClaudeMail.app from login on; the dispatcher restarts itself whenever mail.py changes.
+# Re-running it cleanly replaces any existing copy. Afterwards open one desktop session in
+# ~/ResilioSync/Services/ClaudeMail/mail/<Machine>/post office and pin it (the Post office).
 #
-#   ./install_launchd.sh           # install + (re)load
-#   ./install_launchd.sh uninstall # unload + remove agent and hook (mailbox left alone)
+#   bash install_launchd.sh           # install + (re)load
+#   bash install_launchd.sh uninstall # unload + remove agent and hooks (mailbox left alone)
+# Call it through bash: an edit made on a Windows machine drops the executable bit on the Macs (seen 2026-09-28).
 set -euo pipefail
+
+# Never under sudo: $(id -u) would be 0, so launchctl would target gui/0 ("125: Domain does not support
+# specified action"), and ~/.claude/settings.json would be left owned by root (seen on Sandbank 2026-09-28).
+if [[ "$EUID" -eq 0 ]]; then
+    echo "Run this as your own user, not with sudo or as root." >&2
+    exit 1
+fi
 
 LABEL="com.goocy.claudemail"
 DIR="$(cd "$(dirname "$0")" && pwd)"
 PLIST="$HOME/Library/LaunchAgents/$LABEL.plist"
 LOGDIR="$HOME/.claude/claudemail/logs"                   # machine-local; $DIR/logs (synced, both Macs wrote one file) until 2026-09-28
 LOG="$LOGDIR/launchd.log"
-PYTHON="/opt/homebrew/bin/python3"
+PYTHON="/opt/homebrew/bin/python3"                      # Apple Silicon Homebrew (Altiplano)
+[[ -x "$PYTHON" ]] || PYTHON="/usr/local/bin/python3"   # Intel Homebrew (Sandbank)
 mkdir -p "$LOGDIR"
 
 if [[ "${1:-}" == "uninstall" ]]; then
-    launchctl bootout "gui/$(id -u)/$LABEL" 2>/dev/null || true
+    launchctl bootout "gui/$(id -u)/$LABEL" || true   # stderr kept: "not loaded" is harmless, anything else is worth seeing
     rm -f "$PLIST"
     "$PYTHON" -B "$DIR/mail.py" uninstall-hook
     echo "Removed LaunchAgent $LABEL and the hook."
@@ -32,8 +42,9 @@ fi
 
 APP="$DIR/ClaudeMail.app"
 WRAPPER="$APP/Contents/MacOS/claudemail"
-if [[ ! -x "$WRAPPER" ]] || ! codesign --verify --strict "$APP" >/dev/null 2>&1; then
-    echo "Wrapper missing or unsigned at $APP, building it."
+if [[ ! -x "$WRAPPER" ]] || ! codesign --verify --strict "$APP" >/dev/null 2>&1 \
+   || ! lipo -archs "$WRAPPER" 2>/dev/null | grep -qw "$(uname -m)"; then
+    echo "Wrapper missing, unsigned or lacking $(uname -m) at $APP, building it."
     "$DIR/build_app.sh"
 fi
 
@@ -68,9 +79,9 @@ cat > "$PLIST" <<PLISTEOF
 </plist>
 PLISTEOF
 
-launchctl bootout "gui/$(id -u)/$LABEL" 2>/dev/null || true
+launchctl bootout "gui/$(id -u)/$LABEL" || true   # stderr kept: "not loaded" is harmless, anything else is worth seeing
 launchctl bootstrap "gui/$(id -u)" "$PLIST"
 echo "Installed and loaded LaunchAgent $LABEL."
 echo "Runs : $WRAPPER -B $DIR/mail.py watch"
 echo "Log  : $LOGDIR/claudemail.<machine>.<yyMMdd>.log"
-echo "Next: open one desktop session in ~/ResilioSync/Mailbox/<Machine>/post office and pin it."
+echo "Next: open one desktop session in ~/ResilioSync/Services/ClaudeMail/mail/<Machine>/post office and pin it."
