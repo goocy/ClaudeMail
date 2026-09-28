@@ -48,5 +48,5 @@ Start-ScheduledTask -TaskName $TaskName
 
 Write-Host ""
 Write-Host "Registered and started scheduled task '$TaskName' (at logon, continuous)." -ForegroundColor Green
-Write-Host "Logs: $ProjectDir\logs\claudemail.<machine>.<yyMMdd>.log"
+Write-Host "Logs: $env:USERPROFILE\.claude\claudemail\logs\claudemail.<machine>.<yyMMdd>.log (machine-local)"
 Write-Host "Next: open one desktop session in ResilioSync\Services\ClaudeMail\mail\<Machine>\post office and pin it (the Post office)."

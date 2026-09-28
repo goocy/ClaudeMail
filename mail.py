@@ -13,11 +13,15 @@ On disk (synced by Resilio), in this service folder's mail/ (ResilioSync/Mailbox
                                                            waiting for the user, delivered (moves to read/ with it)
     mail/<Machine>/desks/<Desk>/read/                      delivered mail
     mail/<Machine>/desks/<Desk>/desk.json                  its folders and sessions (written by the dispatcher)
-    mail/<Machine>/dispatcher.json                         the dispatcher's heartbeat and who listens where
+    mail/<Machine>/reports/<stamp>.json                    the dispatcher's heartbeat and who listens where; each
+                                                           report is a new file, never rewritten, so Resilio never
+                                                           sees two versions of one path (dispatcher.json until
+                                                           2026-09-28 conflicted); the newest name wins
     mail/<Machine>/post office/                            the Post office session's working folder
 
 Locally, never synced: ~/.claude/claudemail/ (sessions/<id>.json: each session's desk and activity; waiters/<id>.json:
-the running Stop waiter of each session; dispatcher.json: the local heartbeat hooks check).
+the running Stop waiter of each session; dispatcher.json: the local heartbeat hooks check; logs/claudemail.<machine>.<yymmdd>.log:
+this machine's log, in the synced service folder until 2026-09-28).
 
 Who does what:
     hook      SessionStart and UserPromptSubmit: register the session, hand it its own desk's mail as context.
@@ -59,8 +63,8 @@ SYNC_ROOT = SERVICE_DIR.parent.parent
 MAILBOX_ROOT = SERVICE_DIR / "mail"
 OLD_MAILBOX_ROOT = SYNC_ROOT / "Mailbox"                            # until 2026-09-27; too conspicuous in ResilioSync
 CONFIG_DIR = SERVICE_DIR / "config"
-LOG_DIR = SERVICE_DIR / "logs"
 LOCAL_DIR = Path.home() / ".claude" / "claudemail"
+LOG_DIR = LOCAL_DIR / "logs"                                        # this service folder's logs/ until 2026-09-28
 OLD_WAITER_DIR = Path.home() / ".claude" / "claudemail-waiters"     # the pre-desk waiters, retired by the new ones
 
 DESKS = "desks"
@@ -71,6 +75,8 @@ POST_OFFICE = "Post office"
 POST_OFFICE_DIR = "post office"
 DESK_FILE = ".desk"
 DESK_INFO = "desk.json"
+REPORTS = "reports"
+OLD_REPORT = "dispatcher.json"                                      # the single rewritten report, until 2026-09-28
 STATUS_SUFFIX = ".status.json"
 GROUP_FOLDERS = ["Services", "Projects", "Tools"]                  # desks sit one level below these
 HEADER_FIELDS = ["from", "from_session", "to", "subject", "sent", "id", "conversation", "in_reply_to",
@@ -187,6 +193,36 @@ def desk_for(folder: str) -> str:
 
 def machine_dir(machine: str) -> Path:
     return MAILBOX_ROOT / machine
+
+
+def report_names(machine: str) -> list:
+    """This machine's report files, newest first (the names are sortable time stamps)."""
+    folder = machine_dir(machine) / REPORTS
+    try:
+        return sorted((p for p in folder.glob("*.json") if not p.name.startswith(".")), key=lambda p: p.name, reverse=True)
+    except OSError:
+        return []
+
+
+def read_report(machine: str) -> dict:
+    """The newest dispatcher report that parses; Resilio may still be delivering the very newest one."""
+    for path in report_names(machine):
+        report = read_json(path)
+        if report:
+            return report
+    return {}
+
+
+def write_report(machine: str, report: dict) -> None:
+    """A new file per report, then drop all but it and the one before it (a reader may be opening that one)."""
+    stamp = datetime.datetime.now()
+    path = machine_dir(machine) / REPORTS / (stamp.strftime("%y%m%d-%H%M%S-") + "%03d" % (stamp.microsecond // 1000) + ".json")
+    write_json(path, report)
+    for old in report_names(machine)[2:]:
+        try:
+            old.unlink()
+        except OSError:
+            pass
 
 
 def desk_dir(machine: str, desk: str) -> Path:
@@ -728,7 +764,7 @@ def listening_view(machine: str, config: dict) -> tuple:
     """(fresh, listening {desk: [sessions]}, report, as_of) for a machine. On this machine the live waiters are asked
     directly; the dispatcher's report lags a stopped or started waiter by up to one poll (seen in T6). For another
     machine the report is all there is, and Resilio's sync delay comes on top, so as_of says how old it is."""
-    report = read_json(machine_dir(machine) / "dispatcher.json")
+    report = read_report(machine)
     fresh = iso_age(report.get("updated")) < 60 * setting(config, "stale_minutes", 6)
     if machine == this_machine(config):
         listening = {}
@@ -900,7 +936,7 @@ def cmd_desk_of(args, config: dict) -> None:
 
 def log(machine: str, message: str) -> None:
     try:
-        LOG_DIR.mkdir(exist_ok=True)
+        LOG_DIR.mkdir(parents=True, exist_ok=True)
         now = datetime.datetime.now()
         path = LOG_DIR / ("claudemail." + machine.casefold() + "." + now.strftime("%y%m%d") + ".log")
         with open(path, "a", encoding="utf-8") as fh:
@@ -1262,6 +1298,10 @@ def cmd_dispatch(args, config: dict) -> None:
     version = code_version()
     ensure_post_office(machine)
     import_legacy_sessions(machine, config)
+    try:
+        (machine_dir(machine) / OLD_REPORT).unlink()
+    except OSError:
+        pass
     log(machine, "dispatcher started (pid " + str(os.getpid()) + ", mail.py " + version + ")")
     state = {}
     last_report = 0.0
@@ -1283,8 +1323,7 @@ def cmd_dispatch(args, config: dict) -> None:
             dispatch_mail(machine, config, listening, by_desk, state)
             report = {"listening": listening, "post_office": bool(by_desk.get(POST_OFFICE))}
             if report != last_listening or time.time() - last_report > 60:
-                write_json(machine_dir(machine) / "dispatcher.json",
-                           dict(report, machine=machine, pid=os.getpid(), version=version, updated=now_iso()))
+                write_report(machine, dict(report, machine=machine, pid=os.getpid(), version=version, updated=now_iso()))
                 last_report = time.time()
                 last_listening = report
             if time.monotonic() - last_beat >= 60 * setting(config, "heartbeat_minutes", 60):

@@ -13,7 +13,7 @@ set -euo pipefail
 LABEL="com.goocy.claudemail"
 DIR="$(cd "$(dirname "$0")" && pwd)"
 PLIST="$HOME/Library/LaunchAgents/$LABEL.plist"
-LOGDIR="$DIR/logs"
+LOGDIR="$HOME/.claude/claudemail/logs"                   # machine-local; $DIR/logs (synced, both Macs wrote one file) until 2026-09-28
 LOG="$LOGDIR/launchd.log"
 PYTHON="/opt/homebrew/bin/python3"
 mkdir -p "$LOGDIR"
@@ -61,7 +61,7 @@ cat > "$PLIST" <<PLISTEOF
     <key>ThrottleInterval</key> <integer>60</integer>
     <key>ProcessType</key>      <string>Background</string>
 
-    <!-- Bootstrap output and tracebacks only; mail.py writes logs/claudemail.<machine>.<yyMMdd>.log itself. -->
+    <!-- Bootstrap output and tracebacks only; mail.py writes ~/.claude/claudemail/logs/claudemail.<machine>.<yyMMdd>.log itself. -->
     <key>StandardOutPath</key>  <string>$LOG</string>
     <key>StandardErrorPath</key><string>$LOG</string>
 </dict>
