@@ -1014,6 +1014,19 @@ Design: `~/ResilioSync/Services/ClaudeMail/260927 Desk design.md`. This file is 
 """
 
 
+STEWARD_GUIDE = """# Steward
+
+This folder is the working folder of the ClaudeMail Steward on this machine: one ordinary desktop session, pinned in the sidebar, that takes the mail addressed to the machine as a whole (`--to <Machine>` or `--to all`). It is the only session on the desk `General` (set by the `.desk` file here); sessions in the home folder are on the desk `Home` and never receive General mail.
+
+- General mail is machine chores: install or update a service, roll out a plugin or guidance, enrol a key, take part in a census, a job report. Do it the way any session would, under the user's usual rules; when a task needs the user (an installer, Touch ID, an approval), ask him here, since he opens this session to see what the machine was asked to do.
+- Work in whatever folder the task needs; the desk stays General because the session was started here.
+- Answer with `mail.py send --reply-to <message>` so the reply goes back to the sender's desk.
+- If the user types anything here after an app restart, answer briefly; until this session gets a turn it is deaf, and General mail waits for the user.
+
+Design: `~/ResilioSync/Services/ClaudeMail/260927 Desk design.md` and D-260929-1 in `Decisions/Decisions.md` there. This file is rewritten by the dispatcher; edit `STEWARD_GUIDE` in `mail.py` instead.
+"""
+
+
 def post_office_settings() -> dict:
     """Project settings for the Post office folder: it may list and message sessions and run `mail.py desk-of` and
     `mail.py nudged` without an approval prompt each time. Nothing else is allowed beyond the user's own settings."""
@@ -1040,6 +1053,42 @@ def ensure_post_office(machine: str, own: bool = True) -> None:
         except OSError:
             pass
     desk_dir(machine, POST_OFFICE).mkdir(parents=True, exist_ok=True)
+
+
+def ensure_steward(machine: str) -> None:
+    """The Steward folder with its .desk and CLAUDE.md."""
+    folder = steward_dir(machine)
+    folder.mkdir(parents=True, exist_ok=True)
+    for path, text in {folder / DESK_FILE: GENERAL + "\n", folder / "CLAUDE.md": STEWARD_GUIDE}.items():
+        try:
+            if not path.is_file() or path.read_text(encoding="utf-8") != text:
+                write_atomically(path, text)
+        except OSError:
+            pass
+    desk_dir(machine, GENERAL).mkdir(parents=True, exist_ok=True)
+
+
+def realign_sessions(machine: str) -> None:
+    """Put every local session record on the desk its folder gives under the current rules, and retire the Stop waiter
+    of any session that moved, so it stops watching the old desk (a waiter leaves once its file names another pid; the
+    session's next turn starts one on the new desk). Run at dispatcher start, since the rules only change with mail.py.
+    Written for the General -> Home move of 2026-09-29: home-folder waiters would otherwise keep taking General mail."""
+    for record in local_sessions():
+        session = clean_id(record.get("session"))
+        if not session or not record.get("folder"):
+            continue
+        desk = desk_for(record["folder"])
+        if desk == record.get("desk"):
+            continue
+        log(machine, "session " + session[:8] + " moved from desk " + str(record.get("desk")) + " to " + desk)
+        record["desk"] = desk
+        try:
+            write_json(session_file(session), record)
+            waiter = read_json(waiter_file(session))
+            if waiter and waiter.get("desk") != desk:
+                write_json(waiter_file(session), dict(waiter, pid=0, retired=now_iso()))
+        except OSError:
+            pass
 
 
 def relocate_old_mailbox(machine: str) -> int:
@@ -1254,9 +1303,11 @@ def to_user(machine: str, desk: str, message: Path, status: dict, why: str) -> N
         return
     status.update(state="waiting for the user", reason=why, user_notified_at=now_iso())
     write_status(message, status)
+    where = ("Type anything into the Steward session on " + machine if desk == GENERAL
+             else "Open a Claude session in the " + desk + " project on " + machine)
     notify(machine, "Claude mail waits on " + desk,
-           "From " + header.get("from", "?") + ": " + header.get("subject", "") + "\nOpen a Claude session in the "
-           + desk + " project on " + machine + " to receive it (" + why + ").")
+           "From " + header.get("from", "?") + ": " + header.get("subject", "") + "\n" + where + " to receive it ("
+           + why + ").")
 
 
 def clean_statuses(machine: str, config: dict) -> None:
