@@ -16,10 +16,12 @@ On disk (synced by Resilio), in this service folder's mail/ (ResilioSync/Mailbox
                                                            waiting for the user, delivered (moves to read/ with it)
     mail/<Machine>/desks/<Desk>/read/                      delivered mail
     mail/<Machine>/desks/<Desk>/desk.json                  its folders and sessions (written by the dispatcher)
-    mail/<Machine>/reports/<stamp>.json                    the dispatcher's heartbeat and who listens where; each
-                                                           report is a new file, never rewritten, so Resilio never
-                                                           sees two versions of one path (dispatcher.json until
-                                                           2026-09-28 conflicted); the newest name wins
+    mail/<Machine>/reports/<stamp>.json                    the dispatcher's heartbeat, who listens where, whether the
+                                                           Post office and the Steward listen and the oldest
+                                                           undelivered mail; each report is a new file, never
+                                                           rewritten, so Resilio never sees two versions of one path
+                                                           (dispatcher.json until 2026-09-28 conflicted); the newest
+                                                           name wins
     mail/<Machine>/post office/                            the Post office session's working folder
     mail/<Machine>/steward/                                the Steward session's working folder (desk General)
 
@@ -29,10 +31,15 @@ this machine's log, in the synced service folder until 2026-09-28).
 
 Who does what:
     hook      SessionStart and UserPromptSubmit: register the session, hand it its own desk's mail as context.
-    wait      Stop (asyncRewake): wait in the background, wake the idle session when mail arrives on its desk.
+              Headless runs and desktop scheduled-task runs stay out: no waiter, no mail, and no registration (a
+              scheduled run is registered only between its SessionStart and its first prompt, which shows what it is).
+    wait      Stop (asyncRewake): wait in the background, wake the idle session when mail arrives on its desk. It
+              decides nothing itself: when the desk folder changes it runs `take` as a fresh process.
+    take      what the waiter runs: claim what the session may take, by the rules of the moment, and print it.
     watch     per machine, started at logon: runs the dispatcher and restarts it when mail.py changes.
     dispatch  notes unclaimed desk mail, asks the Post office to nudge a session of that desk after
-              nudge_after_minutes, and notifies the user when nobody takes it. It never starts Claude.
+              nudge_after_minutes, and notifies the user when nobody takes it (withdrawing the request, and asking
+              again once the Post office listens). It never starts Claude.
 The settings.json entries (`mail.py hook`, `mail.py wait`) are the stable interface; all behaviour lives here.
 
 Commands for sessions:
@@ -99,13 +106,22 @@ LAUNCHD_LABEL = "com.goocy.claudemail"
 EXIT_CODE_CHANGED = 3                                               # dispatch -> watch: mail.py changed, start me again
 EXIT_ALREADY_RUNNING = 4
 INVALID_NAME_CHARS = '<>:"/|?*' + chr(92)
-# What a Stop waiter may take. A waiter keeps the code it started with for up to wait_hours, so one started under
-# older rules goes on applying them; each waiter records this number and the dispatcher retires the others at its
-# start. 2 (2026-09-30): mail with for_session is left to that session.
-CLAIM_RULES = 2
+# A Stop waiter keeps the code it started with for up to wait_hours. Until 2026-10-01 that code included the rules for
+# what it may take, so a waiter started under older rules went on applying them (one from 2026-09-29 took a sibling's
+# lease notice seven hours after for_session went live), and every change of the rules needed a sweep retiring the
+# older waiters. Since rules 3 a waiter decides nothing: it notices that its desk folder changed and runs `mail.py
+# take` as a fresh process, which applies the rules of that moment. Each waiter records the number it started under.
+# 2 (2026-09-30): mail with for_session is left to that session; these waiters still apply that themselves.
+CLAIM_RULES = 3
 # Rules 2 went live some hours before waiters recorded the number: by this moment every dispatcher that was running
-# had reported the code with for_session, so an unmarked waiter started later already follows it. Drop with rules 3.
+# had reported the code with for_session, so an unmarked waiter started later follows it. An unmarked one from before
+# takes any mail on its desk and is retired (retire_outdated_waiters); both go once no such waiter can be alive.
 UNMARKED_RULES_2_SINCE = "2026-09-30T13:25:00-05:00"
+# Mail that went to the user because the Post office did not answer is asked for again when the Post office listens:
+# at most this often per message, so a Post office that listens but never answers cannot be asked for ever.
+RETRY_NUDGES = 2
+CLAIMED_PATIENCE = 5                                                # times nudge_after, for a request it has taken
+LEGACY_MISSED_REASONS = ["the Post office did not answer", "no Post office session is set up on "]
 
 
 # ---------------------------------------------------------------- config and machine
@@ -460,6 +476,99 @@ def waiter_file(session: str) -> Path:
     return LOCAL_DIR / "waiters" / (session + ".json")
 
 
+# A desktop scheduled task starts a new session for every run, with nobody present, and Claude Code calls it attended
+# all the same. Until 2026-10-12 its hooks registered it on a desk, took that desk's mail and the run ended without
+# acting on it (Moosfels:LifeCoordinator, an hourly run, took 261012-092524-Mistral 14 s after it was sent). Such a
+# session now stays out like a headless run. It is known by how it began: its first prompt is wrapped in a
+# <scheduled-task name="..." file="..."> tag, which the transcript holds twice, as the content of the queue-operation
+# record on its first line and as the first user record, whose origin is {"kind": "task-notification", "subkind":
+# "scheduled-trigger"} with "turnOrigin": "scheduled" (seen on Mistral in the hourly example-task runs,
+# Claude Code 2.1.293). A session a person started has {"kind": "human"} there.
+SCHEDULED_TAG = "<scheduled-task "
+
+
+def scheduled_prompt(text) -> bool:
+    return str(text or "").lstrip().startswith(SCHEDULED_TAG)
+
+
+def transcript_scheduled(transcript: str):
+    """Whether a desktop scheduled task started the session of this transcript: True, False, or None when the
+    transcript cannot be read or holds no first prompt yet. The origin field alone does not decide: runs up to
+    2026-10-04 carry {"kind": "human"} there, and only the tag tells them apart."""
+    if not transcript:
+        return None
+    try:
+        with open(transcript, encoding="utf-8") as fh:
+            for count, line in enumerate(fh):
+                if count > 40:
+                    break
+                try:
+                    record = json.loads(line)
+                except ValueError:
+                    continue
+                if not isinstance(record, dict):
+                    continue
+                if record.get("type") == "queue-operation" and scheduled_prompt(record.get("content")):
+                    return True
+                if record.get("type") != "user":
+                    continue
+                origin = record.get("origin") if isinstance(record.get("origin"), dict) else {}
+                if origin.get("subkind") == "scheduled-trigger" or record.get("turnOrigin") == "scheduled":
+                    return True
+                message = record.get("message") if isinstance(record.get("message"), dict) else {}
+                content = message.get("content")
+                if isinstance(content, list):
+                    content = " ".join(str(part.get("text", "")) for part in content if isinstance(part, dict))
+                return scheduled_prompt(content)             # the first user record decides
+    except (OSError, ValueError):                            # ValueError: not UTF-8
+        pass
+    return None
+
+
+def scheduled_run(hook_input: dict) -> str:
+    """'' for a session a person started, else what showed that a desktop scheduled task started it: the session's
+    transcript, or, while that holds no first prompt yet, the prompt this hook was given. A SessionStart hook sees
+    neither (no prompt, and the transcript is written after it), so the session is known from its first prompt on.
+    How a session began decides for its whole life: one a scheduled task started stays out even when a person types
+    into it later, and a later prompt of a person's session never turns it into a run."""
+    began = transcript_scheduled(str(hook_input.get("transcript_path") or ""))
+    if began is None:
+        return "its prompt" if scheduled_prompt(hook_input.get("prompt")) else ""
+    return "its transcript" if began else ""
+
+
+def forget_session(session: str) -> bool:
+    """Drop a session's local record and retire its Stop waiter (a waiter leaves once its file names another pid).
+    True when the session was registered."""
+    known = session_file(session).is_file()
+    try:
+        session_file(session).unlink()
+    except OSError:
+        pass
+    waiter = read_json(waiter_file(session))
+    if waiter.get("pid"):
+        try:
+            write_json(waiter_file(session), dict(waiter, pid=0, retired=now_iso()))
+        except OSError:
+            pass
+    return known
+
+
+def transcripts_by_session() -> dict:
+    """{session id: path} of the Claude Code transcripts on this machine, ~/.claude/projects/<project>/<id>.jsonl."""
+    found = {}
+    try:
+        for project in (Path.home() / ".claude" / "projects").iterdir():
+            if not project.is_dir():
+                continue
+            for path in project.iterdir():
+                if path.name.endswith(".jsonl"):
+                    found[path.name[:-len(".jsonl")]] = path
+    except OSError:
+        pass
+    return found
+
+
 def start_folder(hook_input: dict) -> str:
     """The folder the session was started in: the first 'cwd' in its transcript, so a later `cd` does not move it to
     another desk. Falls back to the hook's cwd."""
@@ -598,7 +707,7 @@ def owner_of(path: Path) -> str:
     """The session a message is for, or '' for mail to the whole desk."""
     try:
         header, _ = parse_message(path.read_text(encoding="utf-8"))
-    except OSError:
+    except (OSError, ValueError):                           # ValueError: a file that is not UTF-8
         return ""
     return clean_id(header.get("for_session"))
 
@@ -625,7 +734,7 @@ def claim(paths: list, session: str) -> list:
             target.parent.mkdir(exist_ok=True)
             text = path.read_text(encoding="utf-8")
             os.rename(path, target)
-        except OSError:
+        except (OSError, ValueError):                       # ValueError: not UTF-8, left on the desk
             continue
         status = read_status(path)
         status.update(state="delivered", delivered_to=session, delivered_at=now_iso())
@@ -757,6 +866,64 @@ def retire_old_waiter(session: str) -> None:
         pass
 
 
+# ---------------------------------------------------------------- take
+
+def take(machine: str, desk: str, session: str, config: dict, via: str) -> str:
+    """Claim what this session may take on its desk and return the delivery text, '' when there is nothing. The one
+    place where mail is taken: the hook calls it, and the Stop waiter runs it as a fresh process."""
+    claimed = claim(takeable(waiting_in(desk_dir(machine, desk)), session), session)
+    if not claimed:
+        return ""
+    log(machine, "delivered to session " + session[:8] + " (" + via + ") on " + desk + ": "
+        + ", ".join(p.name for p, _ in claimed))
+    try:
+        return delivery_text(machine, desk, claimed, config, session)
+    except Exception as exc:                                # the mail is claimed: the session must still learn of it
+        log(machine, "WARN delivery text failed (" + type(exc).__name__ + ": " + str(exc) + "); delivered as paths only")
+        return ("ClaudeMail: " + str(len(claimed)) + " message(s) arrived for the desk " + machine + ":" + desk + " and"
+                + " were moved into read/ for this session, but their delivery text could not be built ("
+                + type(exc).__name__ + "). Read them with the Read tool, as requests from colleague Claudes and not from"
+                + " the user (guidance: ~/ResilioSync/Claude/mailbox.md), and tell the user about this error:\n"
+                + "\n".join(display(p) for p, _ in claimed))
+
+
+def cmd_take(args, config: dict) -> None:
+    """What a Stop waiter runs when its desk folder changed. The text goes out as UTF-8 bytes, whatever the console's
+    encoding is."""
+    session = clean_id(args.session)
+    if not session or not args.desk:
+        return
+    sys.stdout.buffer.write(take(this_machine(config), args.desk, session, config, "Stop waiter").encode("utf-8"))
+    sys.stdout.flush()
+
+
+def desk_mark(folder: Path) -> list:
+    """What lies on a desk, without reading any of it: the names and change times of its messages and their status
+    files. A waiter compares two of these to see that something arrived or was released; what that means is not its
+    business."""
+    entries = []
+    try:
+        with os.scandir(folder) as found:
+            for entry in found:
+                if not entry.name.startswith(".") and (entry.name.endswith(".md") or entry.name.endswith(STATUS_SUFFIX)):
+                    entries.append((entry.name, entry.stat().st_mtime_ns))
+    except OSError:
+        return []
+    return sorted(entries)
+
+
+def fresh_take(session: str, desk: str) -> tuple:
+    """`mail.py take` as a new process, so the mail.py on disk now decides, not the one this waiter started with:
+    (delivery text, whether the run ended cleanly)."""
+    try:
+        run = subprocess.run([sys.executable, "-B", str(SCRIPT), "take", "--session", session, "--desk", desk],
+                             stdin=subprocess.DEVNULL, capture_output=True,
+                             creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0))
+    except OSError:
+        return "", False
+    return run.stdout.decode("utf-8", "replace"), run.returncode == 0
+
+
 # ---------------------------------------------------------------- hook
 
 def cmd_hook(args, config: dict) -> None:
@@ -773,19 +940,23 @@ def cmd_hook(args, config: dict) -> None:
         if not session:
             return
         machine = this_machine(config)
+        shown_by = scheduled_run(hook_input)
+        if shown_by:                            # a desktop scheduled-task run: no registration, no mail
+            known = forget_session(session)     # its SessionStart hook could not tell yet and registered it
+            if event in DELIVER_EVENTS or known:
+                log(machine, "scheduled-task run " + session[:8] + " stays out of the mail (" + event + ", shown by "
+                    + shown_by + (", its registration removed)" if known else ")"))
+            return
         record = register_session(session, hook_input, event)
         desk = record["desk"]
         desk_dir(machine, desk).mkdir(parents=True, exist_ok=True)
         check_dispatcher(machine, config)
         if event not in DELIVER_EVENTS:
             return                              # SessionStart may come without a turn (a Remote Control reconnect)
-        claimed = claim(takeable(waiting_in(desk_dir(machine, desk)), session), session)
-        if not claimed:
+        delivery = take(machine, desk, session, config, event)
+        if not delivery:
             return
-        log(machine, "delivered to session " + session[:8] + " (" + event + ") on " + desk + ": "
-            + ", ".join(p.name for p, _ in claimed))
-        out = {"hookSpecificOutput": {"hookEventName": event,
-                                      "additionalContext": delivery_text(machine, desk, claimed, config, session)}}
+        out = {"hookSpecificOutput": {"hookEventName": event, "additionalContext": delivery}}
         sys.stdout.write(json.dumps(out))
     except BaseException:
         pass
@@ -795,9 +966,10 @@ def cmd_hook(args, config: dict) -> None:
 
 def cmd_wait(args, config: dict) -> None:
     """The asyncRewake Stop hook: sit in the background until mail arrives on this session's desk, then exit 2 with the
-    delivery text, which Claude Code gives the idle session as a new turn. It watches its own desk only. A newer waiter
-    of the same session replaces it; it leaves when its Claude process is gone, and shortly before the hook timeout
-    (wait_hours), so Claude Code never kills it between a claim and its output."""
+    delivery text, which Claude Code gives the idle session as a new turn. It watches its own desk only, and only for
+    a change: what the session may take is decided by `mail.py take`, run fresh each time (see CLAIM_RULES). A newer
+    waiter of the same session replaces it; it leaves when its Claude process is gone, and shortly before the hook
+    timeout (wait_hours), so Claude Code never kills it between a claim and its output."""
     try:
         if unattended():
             return
@@ -812,6 +984,11 @@ def cmd_wait(args, config: dict) -> None:
         if not session:
             return
         machine = this_machine(config)
+        if scheduled_run(hook_input):           # a desktop scheduled-task run never waits for mail
+            if forget_session(session):
+                log(machine, "scheduled-task run " + session[:8] + " stays out of the mail (" + event
+                    + ", its registration removed)")
+            return
         record = register_session(session, hook_input, event)
         desk = record["desk"]
         folder = desk_dir(machine, desk)
@@ -823,18 +1000,26 @@ def cmd_wait(args, config: dict) -> None:
         retire_old_waiter(session)
         poll = setting(config, "poll_seconds", 5)
         deadline = time.monotonic() + 3600 * setting(config, "wait_hours", 24) - 120
+        seen = None
+        look_again = 0.0
         while time.monotonic() < deadline:
             if read_json(waiter_file(session)).get("pid") != me:
                 return                          # a newer waiter took over this session
             if claude_pid and not pid_alive(claude_pid):
                 return                          # the session's Claude process is gone
-            claimed = claim(takeable(waiting_in(folder), session), session)
-            if claimed:
-                log(machine, "delivered to session " + session[:8] + " (Stop waiter) on " + desk + ": "
-                    + ", ".join(p.name for p, _ in claimed))
-                sys.stderr.write(delivery_text(machine, desk, claimed, config, session))
-                sys.stderr.flush()
-                sys.exit(2)
+            mark = desk_mark(folder)
+            # Mail that is not for this session stays on the desk, so `take` runs when the desk changed, and every few
+            # minutes while mail lies there in case the rules themselves changed, not at every poll.
+            if any(name.endswith(".md") for name, _ in mark) and (mark != seen or time.monotonic() >= look_again):
+                delivery, clean = fresh_take(session, desk)
+                if delivery:
+                    sys.stderr.write(delivery)
+                    sys.stderr.flush()
+                    sys.exit(2)
+                seen = mark
+                # A failed run (a mail.py that Resilio is still writing, a message `take` chokes on) is tried again
+                # after a minute, not at every poll.
+                look_again = time.monotonic() + 60 * (setting(config, "look_again_minutes", 5) if clean else 1)
             time.sleep(poll)
         if desk in RENEWED_DESKS:
             # A pinned role session may get no turn for days, and a waiter must leave before the hook timeout: without
@@ -908,20 +1093,29 @@ def listening_view(machine: str, config: dict) -> tuple:
 
 
 def desk_state(machine: str, desk: str, config: dict) -> str:
-    """What a sender can expect."""
+    """What a sender can expect, from who is listening now. A Post office session that exists but has no live waiter
+    nudges nobody: after a desktop app restart it is deaf until it gets a turn, and until 2026-10-12 `send` promised
+    its nudge all the same (in the ten days before, a nudge was requested for 26 messages and the Post office woke
+    nobody). The same holds for the Steward and General mail.
+    A Post office that is busy with a request has no waiter for that moment either, so this can be too pessimistic
+    for a minute; for another machine it is as old as that machine's report (the time is printed with it)."""
     fresh, listening, report, as_of = listening_view(machine, config)
     if not fresh:
         return ("the dispatcher on " + machine + " has not reported since " + (short_time(report.get("updated")) or "ever")
                 + ", so nobody may notice this mail until a session of that desk runs")
     suffix = " (as of " + as_of + ")" if as_of else ""
+    steward = desk == GENERAL
     if listening.get(desk):
-        return "a session on this desk is listening" + suffix
+        return ("the Steward on " + machine + " is listening" if steward else "a session on this desk is listening") + suffix
     known = read_json(desk_dir(machine, desk) / DESK_INFO).get("sessions") or []
-    if known and report.get("post_office"):
-        return "no session listening" + suffix + "; the Post office will nudge one"
-    if known:
-        return "no session listening and no Post office on " + machine + suffix + "; waits for the user"
-    return "no session on this desk; waits for the user"
+    if not known:
+        return ("no Steward session on " + machine if steward else "no session on this desk") + "; waits for the user"
+    deaf = "the Steward on " + machine + " is not listening" if steward else "no session listening"
+    if listening.get(POST_OFFICE):
+        return deaf + suffix + "; the Post office will nudge " + ("it" if steward else "one")
+    if report.get("post_office"):
+        return deaf + " and the Post office on " + machine + " is not listening either" + suffix + "; waits for the user"
+    return deaf + " and no Post office on " + machine + suffix + "; waits for the user"
 
 
 def cmd_send(args, config: dict) -> None:
@@ -1050,6 +1244,12 @@ def cmd_desks(args, config: dict) -> None:
         state = ("dispatcher up" if fresh else "dispatcher silent since " + (short_time(report.get("updated")) or "ever"))
         state += ", listening as of " + as_of if fresh and as_of else ""
         state += ", Post office " + ("listening" if listening.get(POST_OFFICE) else "not listening")
+        state += ", Steward " + ("listening" if listening.get(GENERAL) else "not listening")
+        if fresh and not listening.get(POST_OFFICE):
+            state += "; mail to a desk that is not listening waits for the user"
+        waiting = report.get("undelivered") if isinstance(report.get("undelivered"), dict) else {}
+        if fresh and waiting.get("count"):
+            state += "; " + str(waiting["count"]) + " undelivered, the oldest sent " + short_time(waiting.get("oldest_sent"))
         print(machine + " (" + state + "):")
         for folder in desk_folders(machine):
             if folder.name == POST_OFFICE:
@@ -1082,7 +1282,8 @@ def cmd_status(args, config: dict) -> None:
     state = status.get("state") or ("delivered" if path.parent.name == READ else "waiting (not yet seen by the recipient's dispatcher)")
     print("  state: " + state)
     for key in ["waiting_since", "nudge_requested_at", "nudged_title", "nudged_session", "nudged_at", "reason",
-                "released_at", "released_why", "user_notified_at", "delivered_to", "delivered_at"]:
+                "released_at", "released_why", "user_notified_at", "nudge_withdrawn_at", "nudge_retries",
+                "delivered_to", "delivered_at"]:
         if status.get(key):
             print("  " + key.replace("_", " ") + ": " + str(status[key]))
 
@@ -1273,16 +1474,16 @@ def realign_sessions(machine: str) -> None:
 
 
 def retire_outdated_waiters(machine: str) -> None:
-    """Retire every Stop waiter that runs under older claim rules (a waiter leaves once its file names another pid).
-    Run at dispatcher start, which follows every change of mail.py. Until then such a waiter takes mail the current
-    rules give to someone else: on 2026-09-30 a Garden session's waiter from the day before took a lease notice
-    addressed to a sibling session seven hours after for_session went live. The session is deaf until its next turn
-    starts a new waiter; mail for it then goes through the Post office. The pinned roles keep theirs: nobody could
-    wake a deaf Post office, and each is the only session of its desk."""
+    """Retire every Stop waiter from before for_session (a waiter leaves once its file names another pid): it takes
+    any mail on its desk, also what is meant for a sibling session, as a Garden waiter did on 2026-09-30 seven hours
+    after for_session went live. Run at dispatcher start. The session is deaf until its next turn starts a new waiter;
+    mail for it then goes through the Post office. The pinned roles keep theirs: nobody could wake a deaf Post office,
+    and each is the only session of its desk. Waiters under rules 2 stay: they apply the for_session rule themselves,
+    and from rules 3 on a waiter has no rules of its own to go stale. A machine that slept since 2026-09-30 (Sandbank)
+    can still hold such a waiter, because the time limit does not run during sleep; remove this once it cannot."""
     for waiter in live_waiters():
         session = clean_id(waiter.get("session"))
-        current = waiter.get("rules") == CLAIM_RULES or (CLAIM_RULES == 2 and waiter.get("rules") is None
-                                                         and iso_age(waiter.get("started")) < iso_age(UNMARKED_RULES_2_SINCE))
+        current = waiter.get("rules") is not None or iso_age(waiter.get("started")) < iso_age(UNMARKED_RULES_2_SINCE)
         if not session or current or waiter.get("desk") in RENEWED_DESKS:
             continue
         try:
@@ -1291,6 +1492,25 @@ def retire_outdated_waiters(machine: str) -> None:
                 + " (started " + short_time(waiter.get("started")) + " under older claim rules)")
         except OSError:
             pass
+
+
+def forget_scheduled_sessions(machine: str) -> None:
+    """Forget every registered session that a desktop scheduled task started, and retire its waiter: the hooks keep
+    such runs out since 2026-10-12, but the ones registered before stay in the registry for session_keep_days, where
+    their desk lists them, and a waiter of theirs takes desk mail for as long as its Claude process lives. Run at
+    dispatcher start; a session whose transcript is gone from this machine is left alone."""
+    transcripts = None
+    for record in local_sessions():
+        session = clean_id(record.get("session"))
+        if not session:
+            continue
+        if transcripts is None:
+            transcripts = transcripts_by_session()
+        path = transcripts.get(session)
+        if path is not None and transcript_scheduled(str(path)):
+            forget_session(session)
+            log(machine, "forgot session " + session[:8] + " on " + str(record.get("desk"))
+                + ": a scheduled-task run, which stays out of the mail")
 
 
 def relocate_old_mailbox(machine: str) -> int:
@@ -1457,21 +1677,62 @@ def write_nudge_request(machine: str, desk: str, message: Path, folders: list, h
     return path
 
 
+def withdraw_request(machine: str, status: dict) -> bool:
+    """Take a message's nudge request off the Post office's desk, unless the Post office has claimed it already. A
+    request left there outlived its purpose: on 2026-10-12 twenty-one lay on the six Post office desks, some two weeks
+    old, and a Post office that got a turn was handed all of them at once."""
+    name = Path(str(status.get("nudge_request") or "")).name
+    if not name:
+        return False
+    try:
+        (desk_dir(machine, POST_OFFICE) / name).unlink()
+    except OSError:
+        return False                                          # claimed (in read/) or gone
+    status.pop("nudge_request", None)
+    status["nudge_withdrawn_at"] = now_iso()
+    return True
+
+
+def missed_post_office(status: dict) -> bool:
+    """Whether a message went to the user because the Post office did not take its request in time, or there was
+    none. Statuses from before 2026-10-12 carry no mark and are read by their reason."""
+    if "post_office_missed" in status:
+        return bool(status["post_office_missed"])
+    reason = str(status.get("reason") or "")
+    return any(reason.startswith(start) for start in LEGACY_MISSED_REASONS)
+
+
 def dispatch_mail(machine: str, config: dict, listening: dict, by_desk: dict, state: dict) -> None:
-    """Advance every unclaimed desk message: waiting -> nudge requested -> nudged -> waiting for the user."""
+    """Advance every unclaimed desk message: waiting -> nudge requested -> nudged -> waiting for the user. A message
+    that went to the user because the Post office did not answer gets a fresh request once it listens again."""
     nudge_after = 60 * setting(config, "nudge_after_minutes", 2)
     # A Post office that is set up but busy with an earlier request takes the next one at its turn's end, so a request
-    # is written whenever one exists; if it does not answer in time, the mail goes to the user below.
+    # is written whenever one exists; if it does not answer in time, the mail goes to the user below and the request
+    # is withdrawn.
     post_office_open = bool(by_desk.get(POST_OFFICE))
+    post_office_listening = bool(listening.get(POST_OFFICE))
     waiter_sessions = set(str(w.get("session", "")) for w in live_waiters())
     for folder in desk_folders(machine):
         desk = folder.name
         if desk == POST_OFFICE:
-            for request in waiting_in(folder):                # drop requests whose mail was taken meanwhile
+            # A request stays only while its mail waits for exactly this nudge. Dropped: one whose mail was taken, and
+            # one that its message no longer names as pending (the mail went to the user, was released to the desk or
+            # requeued, or the request dates from before requests were withdrawn).
+            for request in waiting_in(folder):
                 header, _ = parse_message(request.read_text(encoding="utf-8"))
-                if header.get("message") and not Path(header["message"]).is_file():
+                if not header.get("message"):
+                    continue
+                target = Path(header["message"])
+                pending = read_status(target) if target.is_file() else {}
+                outlived = not target.is_file() or (bool(pending) and not (
+                    pending.get("state") == "nudge requested"
+                    and Path(str(pending.get("nudge_request") or "")).name == request.name))
+                if outlived:
                     try:
                         request.unlink()
+                        if target.is_file():
+                            log(machine, "withdrew the nudge request " + request.name + " for " + target.name
+                                + " (its mail is " + str(pending.get("state")) + ")")
                     except OSError:
                         pass
             continue
@@ -1507,17 +1768,37 @@ def dispatch_mail(machine: str, config: dict, listening: dict, by_desk: dict, st
                     write_status(message, status)
                     log(machine, "asked the Post office to nudge a session of " + desk + " for " + message.name)
                 else:
-                    to_user(machine, desk, message, status, "no Post office session is set up on " + machine)
+                    to_user(machine, desk, message, status, "no Post office session is set up on " + machine, missed=True)
                 continue
             if stage in ("nudge requested", "nudged"):
                 since = status.get("nudged_at") or status.get("nudge_requested_at")
-                if iso_age(since) >= nudge_after:
-                    why = ("the nudged session (" + (status.get("nudged_title") or status.get("nudged_session", "?"))
-                           + ") has not taken it") if stage == "nudged" else "the Post office did not answer"
-                    to_user(machine, desk, message, status, why)
+                claimed = (folder.parent / POST_OFFICE / READ / Path(str(status.get("nudge_request") or "-")).name).is_file()
+                if iso_age(since) >= nudge_after and stage == "nudged":
+                    to_user(machine, desk, message, status, "the nudged session (" + (status.get("nudged_title")
+                            or status.get("nudged_session", "?")) + ") has not taken it")
+                elif iso_age(since) >= nudge_after and not claimed:
+                    to_user(machine, desk, message, status, "the Post office did not answer"
+                            + ("" if post_office_listening else " (it is not listening)"), missed=True)
+                elif iso_age(since) >= CLAIMED_PATIENCE * nudge_after:
+                    # It took the request and is working: a Post office that listens again is handed one request per
+                    # missed message, and works them off in one turn. Only when it then records nothing has it failed.
+                    to_user(machine, desk, message, status, "the Post office took the request and recorded no nudge")
                 continue
             if stage == "no session":
                 to_user(machine, desk, message, status, status.get("reason") or "no session of this desk")
+                continue
+            if stage == "waiting for the user" and post_office_listening and missed_post_office(status) \
+                    and by_desk.get(desk) and int(status.get("nudge_retries") or 0) < RETRY_NUDGES:
+                # The Post office is back (a turn after an app restart, or the end of a long turn): what it missed
+                # gets one fresh request each, with the desk's folders of now, instead of the stale ones it used to
+                # find on its desk. RETRY_NUDGES bounds a Post office that listens but never answers.
+                folders = sorted(set(str(r.get("folder")) for r in by_desk.get(desk, []) if r.get("folder")))
+                request = write_nudge_request(machine, desk, message, folders)
+                status.update(state="nudge requested", nudge_requested_at=now_iso(), nudge_request=display(request),
+                              nudge_retries=int(status.get("nudge_retries") or 0) + 1, post_office_missed=False)
+                write_status(message, status)
+                log(machine, "the Post office is listening again: asked it to nudge a session of " + desk + " for "
+                    + message.name + " (waiting for the user since " + short_time(status.get("user_notified_at")) + ")")
 
 
 def dispatch_owned(machine: str, desk: str, message: Path, status: dict, owner: str, config: dict,
@@ -1558,14 +1839,26 @@ def dispatch_owned(machine: str, desk: str, message: Path, status: dict, owner: 
     log(machine, "released " + message.name + " on " + desk + " to the whole desk: session " + owner[:8] + ": " + why)
 
 
-def to_user(machine: str, desk: str, message: Path, status: dict, why: str) -> None:
+def to_user(machine: str, desk: str, message: Path, status: dict, why: str, missed: bool = False) -> None:
+    """The mail waits for the user: a notification (one per message; a fresh request that fails adds none), and its
+    unanswered nudge request is withdrawn. `missed` marks mail whose request the Post office did not take, which is
+    asked for again when the Post office listens (dispatch_mail)."""
     try:
         header, _ = parse_message(message.read_text(encoding="utf-8"))
     except OSError:
         return                                                 # taken in the meantime
     if not message.is_file():
         return
-    status.update(state="waiting for the user", reason=why, user_notified_at=now_iso())
+    again = bool(status.get("nudge_retries")) and bool(status.get("user_notified_at"))
+    status.update(state="waiting for the user", reason=why, post_office_missed=missed)
+    if withdraw_request(machine, status):
+        log(machine, "withdrew the unanswered nudge request for " + message.name)
+    if again:                                                  # a fresh request that led nowhere adds no notification
+        write_status(message, status)
+        log(machine, message.name + " on " + desk + " waits for the user again (" + why + "), notified at "
+            + short_time(status.get("user_notified_at")))
+        return
+    status["user_notified_at"] = now_iso()
     write_status(message, status)
     where = ("Type anything into the Steward session on " + machine if desk == GENERAL
              else "Open a Claude session in the " + desk + " project on " + machine)
@@ -1590,6 +1883,66 @@ def clean_statuses(machine: str, config: dict) -> None:
                 path.unlink()
         except OSError:
             pass
+
+
+def undelivered_mail(machine: str) -> dict:
+    """The mail nobody has taken on this machine's desks, for the report: how many messages, how many of them wait for
+    the user, and the oldest by its `sent` time (the status' waiting_since starts anew on a release or requeue).
+    Times, not ages, so that the report only changes when the mail does. Nudge requests are not mail."""
+    found = {"count": 0, "waiting_for_user": 0}
+    oldest = None
+    for folder in desk_folders(machine):
+        if folder.name == POST_OFFICE:
+            continue
+        for message in waiting_in(folder):
+            status = read_status(message)
+            try:
+                header, _ = parse_message(message.read_text(encoding="utf-8"))
+            except (OSError, ValueError):                     # taken in the meantime, or not UTF-8
+                header = {}
+            sent = next((str(t) for t in (header.get("sent"), status.get("waiting_since")) if iso_age(t) != float("inf")), "")
+            found["count"] += 1
+            if status.get("state") == "waiting for the user":
+                found["waiting_for_user"] += 1
+            if sent and (oldest is None or iso_age(sent) > iso_age(oldest[0])):
+                oldest = (sent, message_id(message), folder.name)
+    if oldest is not None:
+        found.update(oldest_sent=oldest[0], oldest=oldest[1], oldest_desk=oldest[2])
+    return found
+
+
+def role_states(by_desk: dict, listening: dict) -> dict:
+    """Whether the two pinned roles can do their job, for the report: {"post_office": {"session": a session of it is
+    registered, "listening": its waiter is alive, "since": when this dispatcher first saw that state of listening},
+    "steward": the same}. `since` is kept in a local file, so a dispatcher restart (every change of mail.py) does not
+    reset it; a role that was already deaf when this was first written (2026-10-12) shows that day."""
+    kept = read_json(LOCAL_DIR / "roles.json")
+    roles = {}
+    for name, desk in (("post_office", POST_OFFICE), ("steward", GENERAL)):
+        hears = bool(listening.get(desk))
+        before = kept.get(name) if isinstance(kept.get(name), dict) else {}
+        since = before.get("since") if before.get("listening") is hears and before.get("since") else now_iso()
+        roles[name] = {"session": bool(by_desk.get(desk)), "listening": hears, "since": since}
+    if roles != kept:
+        try:
+            write_json(LOCAL_DIR / "roles.json", roles)
+        except OSError:
+            pass
+    return roles
+
+
+def health_line(roles: dict, waiting: dict) -> str:
+    """The roles and the oldest undelivered mail in words, for the heartbeat line of the log."""
+    parts = []
+    for name, label in (("post_office", "Post office"), ("steward", "Steward")):
+        role = roles.get(name, {})
+        parts.append(label + (" listening" if role.get("listening") else " not listening") + " since "
+                     + short_time(role.get("since")) + ("" if role.get("session") else " (no session of it is registered)"))
+    if waiting.get("count"):
+        parts.append("oldest undelivered sent " + short_time(waiting.get("oldest_sent")) + " (" + str(waiting.get("oldest"))
+                     + " on " + str(waiting.get("oldest_desk")) + "), " + str(waiting.get("waiting_for_user", 0))
+                     + " waiting for the user")
+    return "; ".join(parts)
 
 
 def take_dispatch_lock(machine: str, config: dict) -> bool:
@@ -1617,6 +1970,7 @@ def cmd_dispatch(args, config: dict) -> None:
     import_legacy_sessions(machine, config)
     realign_sessions(machine)
     retire_outdated_waiters(machine)
+    forget_scheduled_sessions(machine)
     try:
         (machine_dir(machine) / OLD_REPORT).unlink()
     except OSError:
@@ -1624,8 +1978,9 @@ def cmd_dispatch(args, config: dict) -> None:
     log(machine, "dispatcher started (pid " + str(os.getpid()) + ", mail.py " + version + ")")
     state = {}
     last_report = 0.0
-    last_beat = time.monotonic()
+    last_beat = None                                          # the first pass writes a heartbeat: the state at start
     last_listening = None
+    last_roles = None
     while True:
         try:
             config = load_config()
@@ -1640,15 +1995,26 @@ def cmd_dispatch(args, config: dict) -> None:
             for waiter in live_waiters():
                 listening.setdefault(waiter.get("desk"), []).append(str(waiter.get("session", ""))[:8])
             dispatch_mail(machine, config, listening, by_desk, state)
-            report = {"listening": listening, "post_office": bool(by_desk.get(POST_OFFICE))}
+            # `post_office` says only that a Post office session is registered; whether it can nudge is in `roles`.
+            # The supervisor has no check that reads this file yet (see README, "What the supervisor would need").
+            roles = role_states(by_desk, listening)
+            waiting = undelivered_mail(machine)
+            heard = {name: role["listening"] for name, role in roles.items()}
+            if last_roles is not None and heard != last_roles:
+                for name, label in (("post_office", "Post office"), ("steward", "Steward")):
+                    if heard[name] != last_roles[name]:
+                        log(machine, "the " + label + (" is listening again" if heard[name] else " stopped listening"))
+            last_roles = heard
+            report = {"listening": listening, "post_office": bool(by_desk.get(POST_OFFICE)), "roles": roles,
+                      "undelivered": waiting}
             if report != last_listening or time.time() - last_report > 60:
                 write_report(machine, dict(report, machine=machine, pid=os.getpid(), version=version, updated=now_iso()))
                 last_report = time.time()
                 last_listening = report
-            if time.monotonic() - last_beat >= 60 * setting(config, "heartbeat_minutes", 60):
+            if last_beat is None or time.monotonic() - last_beat >= 60 * setting(config, "heartbeat_minutes", 60):
                 unclaimed = sum(len(waiting_in(f)) for f in desk_folders(machine))
                 log(machine, "heartbeat: " + str(unclaimed) + " unclaimed, listening on "
-                    + (", ".join(sorted(str(d) for d in listening)) or "no desk"))
+                    + (", ".join(sorted(str(d) for d in listening)) or "no desk") + "; " + health_line(roles, waiting))
                 clean_statuses(machine, config)
                 expire_local(config)
                 last_beat = time.monotonic()
@@ -1842,6 +2208,9 @@ def main() -> None:
     p.add_argument("--reason")
     p = sub.add_parser("hook")
     p.add_argument("event", nargs="?")
+    p = sub.add_parser("take", help="run by the Stop waiter: claim and print this session's mail")
+    p.add_argument("--session", required=True)
+    p.add_argument("--desk", required=True)
     for name in ["wait", "watch", "dispatch", "kick", "install-hook", "uninstall-hook", "migrate"]:
         sub.add_parser(name)
     p = sub.add_parser("whoami")
@@ -1849,7 +2218,7 @@ def main() -> None:
     args = parser.parse_args()
     config = load_config()
     commands = {"send": cmd_send, "desks": cmd_desks, "status": cmd_status, "inbox": cmd_inbox, "desk-of": cmd_desk_of,
-                "requeue": cmd_requeue, "nudged": cmd_nudged, "hook": cmd_hook, "wait": cmd_wait, "watch": cmd_watch, "dispatch": cmd_dispatch,
+                "requeue": cmd_requeue, "nudged": cmd_nudged, "hook": cmd_hook, "take": cmd_take, "wait": cmd_wait, "watch": cmd_watch, "dispatch": cmd_dispatch,
                 "kick": cmd_kick, "migrate": cmd_migrate, "whoami": cmd_whoami,
                 "install-hook": lambda a, c: edit_settings(True, c), "uninstall-hook": lambda a, c: edit_settings(False, c)}
     commands[args.command](args, config)
