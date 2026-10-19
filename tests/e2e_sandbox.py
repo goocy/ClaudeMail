@@ -177,6 +177,11 @@ expect("waiter delivers own desk mail with exit 2", w.returncode == 2 and "Re: L
 (HOME / ".claude/claudemail/waiters/ffff6666-hm.json").write_text(json.dumps({"session": "ffff6666-hm", "desk": "General", "pid": os.getpid()}))
 (mailbox / "General").mkdir(parents=True, exist_ok=True)
 (mailbox / "General" / "desk.json").write_text(json.dumps({"sessions": [{"session": "ffff6666-hm"}]}))
+# two waiter files naming this process: one that started before it (its pid was handed out again), one after it
+for name, desk, started in (("gggg7777-gh", "Ghost", "2026-01-01T00:00:00-05:00"),
+                            ("hhhh7777-gn", "Genuine", datetime.datetime.now().astimezone().isoformat(timespec="seconds"))):
+    (HOME / ".claude/claudemail/waiters" / (name + ".json")).write_text(json.dumps(
+        {"session": name, "desk": desk, "pid": os.getpid(), "started": started, "rules": 3}))
 
 # dispatcher: mail to a deaf desk, no Post office -> waiting for the user
 disp = subprocess.Popen([sys.executable, "-B", str(SVC / "mail.py"), "dispatch"], env=ENV)
@@ -185,6 +190,12 @@ po_again = []
 try:
     time.sleep(3)
     expect("dispatcher report", any((SVC / "mail/Stahlwerk/reports").glob("*.json")))
+    heard = newest_report().get("listening", {})
+    if sys.platform == "win32":                               # a Mac does not check how old the process is
+        expect("a waiter whose pid now belongs to a younger process is not listening, one that started later is",
+               "Genuine" in heard and "Ghost" not in heard, heard)
+    for name in ("gggg7777-gh", "hhhh7777-gn"):
+        (HOME / ".claude/claudemail/waiters" / (name + ".json")).unlink()
     logged = "".join(p.read_text(encoding="utf-8") for p in (HOME / ".claude/claudemail/logs").glob("*.log"))
     expect("the heartbeat at dispatcher start says whether the roles listen",
            "heartbeat: " in logged and "; Post office not listening since " in logged and "Steward not listening since " in logged,
@@ -296,7 +307,8 @@ try:
     d4 = next(p for p in (mailbox / "LifeCoordinator").glob("*.md") if "subject: Deaf4" in p.read_text(encoding="utf-8"))
     wait_for(lambda: status_of(d4).get("state") == "waiting for the user", 20)
     stuck = HOME / ".claude/claudemail/waiters/cccc3333-po.json"
-    stuck.write_text(json.dumps({"session": "cccc3333-po", "desk": "Post office", "pid": os.getpid(), "rules": 3}))
+    stuck.write_text(json.dumps({"session": "cccc3333-po", "desk": "Post office", "pid": os.getpid(), "rules": 3,
+                                 "started": datetime.datetime.now().astimezone().isoformat(timespec="seconds")}))
     wait_for(lambda: status_of(d4).get("nudge_retries") == 2 and status_of(d4).get("state") == "waiting for the user", 30)
     time.sleep(6)
     st = status_of(d4)
@@ -431,9 +443,11 @@ po_wait.stdin = None
 try:
     time.sleep(2)
     pids = {name: json.loads((waiters / (name + ".json")).read_text()).get("pid") for name in marks}
+    # On Windows the old waiter's pid is this suite's, a process younger than the waiter: that waiter is gone, and
+    # there is nothing to retire.
     expect("a waiter from before for_session is retired at dispatcher start, later ones and roles are not",
-           pids == {"jjjj0000-old": 0, "kkkk0000-new": os.getpid(), "mmmm0000-mid": os.getpid(),
-                    "llll0000-role": os.getpid()}, pids)
+           pids == {"jjjj0000-old": os.getpid() if sys.platform == "win32" else 0, "kkkk0000-new": os.getpid(),
+                    "mmmm0000-mid": os.getpid(), "llll0000-role": os.getpid()}, pids)
     for name in marks:
         (waiters / (name + ".json")).unlink()
     expect("a registered scheduled-task session is forgotten at dispatcher start and its waiter retired, a person's is not",

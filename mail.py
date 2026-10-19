@@ -657,7 +657,11 @@ def local_sessions() -> list:
     return [read_json(p) for p in folder.iterdir() if p.name.endswith(".json")]
 
 
-def pid_alive(pid: int) -> bool:
+def pid_alive(pid: int, started: str = "") -> bool:
+    """Whether the process runs. With `started`, the time a process wrote down at its start, a process created after
+    that is another one that was given the same pid, and counts as gone: Windows hands freed pids out again soon (on
+    Mistral on 2026-10-19 the dead waiter of session 22bb22bb had its pid taken by a claude.exe eleven minutes later,
+    and the dispatcher counted that session as listening). Not checked on a Mac, which hands pids out in turn."""
     if pid <= 0:
         return False
     if sys.platform == "win32":
@@ -666,14 +670,24 @@ def pid_alive(pid: int) -> bool:
         kernel32 = ctypes.windll.kernel32
         kernel32.OpenProcess.restype = ctypes.c_void_p
         kernel32.GetExitCodeProcess.argtypes = [ctypes.c_void_p, ctypes.POINTER(ctypes.c_ulong)]
+        kernel32.GetProcessTimes.argtypes = [ctypes.c_void_p] + [ctypes.POINTER(ctypes.c_ulonglong)] * 4
         kernel32.CloseHandle.argtypes = [ctypes.c_void_p]
         handle = kernel32.OpenProcess(0x1000, False, pid)          # PROCESS_QUERY_LIMITED_INFORMATION
         if not handle:
             return False
-        code = ctypes.c_ulong()
-        ok = kernel32.GetExitCodeProcess(handle, ctypes.byref(code))
-        kernel32.CloseHandle(handle)
-        return bool(ok) and code.value == 259                       # STILL_ACTIVE
+        try:
+            code = ctypes.c_ulong()
+            alive = bool(kernel32.GetExitCodeProcess(handle, ctypes.byref(code))) and code.value == 259  # STILL_ACTIVE
+            if alive and started:
+                times = [ctypes.c_ulonglong() for _ in range(4)]
+                if not kernel32.GetProcessTimes(handle, *[ctypes.byref(t) for t in times]):
+                    raise OSError("GetProcessTimes failed for pid " + str(pid))
+                created = (times[0].value - 116444736000000000) / 10 ** 7        # FILETIME: 100 ns since 1601
+                # `started` is in whole seconds and written after the process began, so it may read up to 1 s early.
+                alive = created < datetime.datetime.fromisoformat(started).timestamp() + 1
+            return alive
+        finally:
+            kernel32.CloseHandle(handle)
     try:
         os.kill(pid, 0)
     except PermissionError:
@@ -691,7 +705,9 @@ def live_waiters() -> list:
     alive = []
     for path in folder.iterdir():
         info = read_json(path) if path.name.endswith(".json") else {}
-        if isinstance(info.get("pid"), int) and pid_alive(info["pid"]):
+        # Every waiter writes `started` (since 2026-09-30 at the latest) and lives at most wait_hours, so a file
+        # without it belongs to one long gone, whatever process holds its pid now.
+        if isinstance(info.get("pid"), int) and "started" in info and pid_alive(info["pid"], info["started"]):
             alive.append(info)
     return alive
 
