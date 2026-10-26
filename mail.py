@@ -373,17 +373,32 @@ def running_sessions() -> dict:
     return found
 
 
+STORE_CACHE = {}                                                    # path -> (mtime_ns, size, record), for the dispatcher
+
+
 def desktop_sessions() -> dict:
     """{desktop id (local_...): the desktop app's record} for every session in the app's sidebar on this machine,
-    archived ones included. The app keeps one store per account and organisation."""
-    found = {}
-    store = APP_DIR / "claude-code-sessions"
-    if not store.is_dir():
-        return found
-    for path in store.glob("*/*/local_*.json"):
-        record = read_written(path)
-        if record is not None:
-            found[record["sessionId"]] = record
+    archived ones included. The app keeps one store per account and organisation, and only the signed-in account's is
+    the sidebar (`lastKnownAccountUuid` in its config.json). On Altiplano on 2026-10-26 several accounts' stores held 1,000
+    files and 240 MB, and reading all of them every pass took the dispatcher three minutes; so only that account's
+    files are read, and each only again when it changed."""
+    config = APP_DIR / "config.json"
+    if not config.is_file():
+        return {}                                            # the app was never signed in here
+    account = APP_DIR / "claude-code-sessions" / read_json(config)["lastKnownAccountUuid"]
+    found, seen = {}, set()
+    for path in account.glob("*/local_*.json"):
+        stat = path.stat()
+        seen.add(path)
+        cached = STORE_CACHE.get(path)
+        if cached is None or cached[:2] != (stat.st_mtime_ns, stat.st_size):
+            record = read_written(path)
+            if record is None:
+                continue
+            STORE_CACHE[path] = cached = (stat.st_mtime_ns, stat.st_size, record)
+        found[cached[2]["sessionId"]] = cached[2]
+    for gone in set(STORE_CACHE) - seen:
+        del STORE_CACHE[gone]
     return found
 
 

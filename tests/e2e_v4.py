@@ -20,6 +20,11 @@ APP = HOME / "Library" / "Application Support" / "Claude"
 STORE = APP / "claude-code-sessions" / "acct" / "org"
 for d in [SVC / "config", HOME / ".claude" / "sessions", HOME / ".claude" / "claudemail", STORE, BIN, HOME / "received"]:
     d.mkdir(parents=True)
+(APP / "config.json").write_text(json.dumps({"lastKnownAccountUuid": "acct"}))
+OTHER = APP / "claude-code-sessions" / "other-account" / "org"           # another account's store: not the sidebar
+OTHER.mkdir(parents=True)
+(OTHER / "local_zz.json").write_text(json.dumps({"sessionId": "local_zz", "cliSessionId": "zz", "cwd": "/x", "title": "Other account",
+                                                 "isArchived": False, "lastActivityAt": int(time.time() * 1000)}))
 # A hook that finds no dispatcher heartbeat restarts the machine's real LaunchAgent (launchctl is not faked): the marker
 # of a kick just made keeps the sandbox from doing that (it did once, on 2026-10-26).
 (HOME / ".claude" / "claudemail" / "kick.json").write_text(json.dumps({"at": time.strftime("%Y-%m-%dT%H:%M:%S")
@@ -198,6 +203,7 @@ try:
     expect("sessions lists running and closed, not archived", A in out and B in out and C not in out and "idle" in out
            and "closed" in out and "Foo feature A going" in out, out)
     expect("desk name matched without date stamp", "Pulvermaar:Foo" in out, out)
+    expect("another account's sessions are not listed", "Other account" not in run(["sessions", "Pulvermaar"]).stdout)
 
     # two-stage: a session must choose
     p = run(["send", "--to", "Pulvermaar:Foo", "--subject", "x", "--body-file", body("x")], session=S0, check=False)
