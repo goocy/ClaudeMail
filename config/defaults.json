@@ -1,13 +1,13 @@
 {
-  "_about": "ClaudeMail settings shared by every machine. A machine overrides any of them in config/<machine>.json (lower case, e.g. config/stahlwerk.json), which only that machine edits. 'machines' are the folder names under mail/; 'hostnames' maps a hostname that is not simply the machine name onto one of them (the CLAUDE_MAILBOX_MACHINE environment variable overrides both). wait_hours must match the Stop hook's timeout in settings.json (install-hook writes it).",
+  "_about": "ClaudeMail settings shared by every machine. A machine overrides any of them in config/<machine>.json (lower case, e.g. config/stahlwerk.json), which only that machine edits. 'machines' are the folder names under mail/; 'hostnames' maps a hostname that is not simply the machine name onto one of them (the CLAUDE_MAILBOX_MACHINE environment variable overrides both). open_minutes: how long an opened session may take to start before its mail waits for the user; retry_minutes: how often such mail is tried again.",
   "machines": ["Mistral", "Moosfels", "Stahlwerk", "Teppich", "Altiplano", "Sandbank", "Pulvermaar"],
   "hostnames": {},
   "poll_seconds": 5,
-  "nudge_after_minutes": 2,
+  "open_minutes": 3,
+  "retry_minutes": 60,
   "stale_minutes": 6,
   "kick_every_minutes": 20,
   "heartbeat_minutes": 60,
   "inject_max_chars": 12000,
-  "wait_hours": 24,
   "session_keep_days": 30
 }
