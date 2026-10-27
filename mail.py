@@ -550,11 +550,15 @@ def session_listing(config: dict) -> tuple:
 
 
 def report_names(machine: str) -> list:
-    """A machine's report files, newest first (the names are sortable time stamps)."""
+    """A machine's report files, newest first. Since 2026-10-27 the names are UTC stamps ending in Z, which never go
+    back; a name without the Z is a local-time stamp from before and counts as older than any UTC one, because local
+    names sorted a report written after the clock went back (a time zone change, the DST fall-back) as the oldest, and
+    the writer deleted it at once (Pulvermaar, 2026-10-26)."""
     folder = machine_dir(machine) / REPORTS
     if not folder.is_dir():
         return []
-    return sorted((p for p in folder.glob("*.json") if not p.name.startswith(".")), key=lambda p: p.name, reverse=True)
+    return sorted((p for p in folder.glob("*.json") if not p.name.startswith(".")),
+                  key=lambda p: (p.stem.endswith("Z"), p.name), reverse=True)
 
 
 def read_report(machine: str) -> dict:
@@ -567,8 +571,8 @@ def read_report(machine: str) -> dict:
 def write_report(machine: str, report: dict) -> None:
     """A new file per report, then all but the newest five go: a rewritten file kept causing Resilio conflicts, and
     with only two kept a reader on Mistral briefly found none (Resilio delivered the deletions first, 2026-09-28)."""
-    stamp = datetime.datetime.now()
-    write_json(machine_dir(machine) / REPORTS / (stamp.strftime("%y%m%d-%H%M%S-") + "%03d.json" % (stamp.microsecond // 1000)),
+    stamp = datetime.datetime.now(datetime.timezone.utc)
+    write_json(machine_dir(machine) / REPORTS / (stamp.strftime("%y%m%d-%H%M%S-") + "%03dZ.json" % (stamp.microsecond // 1000)),
                report)
     for old in report_names(machine)[5:]:
         old.unlink()
