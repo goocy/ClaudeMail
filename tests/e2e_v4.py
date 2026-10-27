@@ -87,9 +87,9 @@ if parsed.netloc == "resume" and known:                      # a session the app
 elif parsed.netloc == "resume":
     calls = [json.loads(l) for l in (home / "cli_calls.jsonl").read_text().splitlines()]
     call = [c for c in calls if c["session"] == query["session"]][-1]
-    names = [a[len("--name="):] for a in call["args"] if a.startswith("--name=")]   # the app takes the transcript's custom title (live 2026-10-27)
+    assert call["args"][-1].startswith("/rename "), call    # the app takes the transcript's custom title (live 2026-10-27)
     record = {"sessionId": "local_" + call["session"], "cliSessionId": call["session"], "cwd": call["cwd"],
-              "title": names[0] if names else "Imported", "isArchived": False,
+              "title": call["args"][-1][len("/rename "):], "isArchived": False,
               "lastActivityAt": int(time.time() * 1000)}
     (store / (record["sessionId"] + ".json")).write_text(json.dumps(record))
 else:
@@ -221,6 +221,16 @@ try:
     text = received(A)[-1] if received(A) else ""
     expect("T4 delivery names reply command and body", "--reply-to" in text and "hello A" in text and "opened this session" not in text, text)
 
+    # a session still starting: its registry entry has the socket but no status yet (ended the dispatcher, Stahlwerk 2026-10-27)
+    starting = HOME / ".claude" / "sessions" / (str(os.getpid()) + ".json")
+    starting.write_text(json.dumps({"pid": os.getpid(), "sessionId": E, "cwd": str(FOO), "startedAt": int(time.time() * 1000),
+                                    "messagingSocketPath": str(SOCKETS / "starting.sock"), "hostSessionId": "local_" + E}))
+    time.sleep(2)
+    p = run(["sessions", "Pulvermaar:Foo"], check=False)
+    expect("T4b a starting session is listed as closed, and the dispatcher keeps running", dispatcher.poll() is None
+           and p.returncode == 0 and E in p.stdout, (BASE / "dispatch.err").read_text() + p.stdout + p.stderr)
+    starting.unlink()
+
     # closed session: continue link, then socket
     m5 = sent_path(run(["send", "--to", "Pulvermaar:Foo", "--for-session", B[:8], "--subject", "T5 closed", "--body-file", body("hello B")], session=S0).stdout)
     expect("T5 closed session opened and delivered", wait_for(delivered_to(m5, B)), (HOME / "opened.txt").read_text() if (HOME / "opened.txt").exists() else "")
@@ -234,8 +244,8 @@ try:
     expect("T6 CLI ran in the desk folder", call["cwd"] == str(FOO.resolve()) or call["cwd"] == str(FOO), call)
     expect("T6 delivered to the new session", wait_for(delivered_to(m6, new6)))
     expect("T6 text says ClaudeMail opened it", "opened this session" in (received(new6) or [""])[-1])
-    expect("T6 the proposed name went to the CLI as --name=, whitespace collapsed", "--name=Foo T6 work" in call["args"]
-           and call["args"][-1] == "/cost", call)
+    expect("T6 the proposed name went to the CLI as /rename, whitespace collapsed", call["args"][-1] == "/rename Foo T6 work"
+           and not any(a.startswith("--name") or a == "/cost" for a in call["args"]), call)
     expect("T6 the new session carries the proposed title", json.loads((STORE / ("local_" + new6 + ".json")).read_text())["title"] == "Foo T6 work")
     p = run(["send", "--to", "Pulvermaar:Foo", "--new", "--subject", "x", "--body-file", body("x")], session=S0, check=False)
     expect("T6b a session sending --new without --name is refused", p.returncode != 0 and "--name" in p.stderr, p.stdout + p.stderr)
@@ -254,11 +264,12 @@ try:
     expect("T7b unknown session -> new session", wait_for(lambda: len(opened_sessions()) == 2))
     new7 = opened_sessions()[1]
     expect("T7b delivered with a note naming the missing session", wait_for(delivered_to(m7b, new7)) and G in received(new7)[-1])
+    expect("T7b the new session is titled by the subject", json.loads((STORE / ("local_" + new7 + ".json")).read_text())["title"] == "T7b gone")
     # a program without a session gets a new session without choosing
     m8 = sent_path(run(["send", "--to", "Pulvermaar:Foo", "--to-own-desk", "--subject", "T8 lease notice", "--body-file", body("job done")]).stdout)
     expect("T8 program mail -> new session", wait_for(lambda: len(opened_sessions()) == 3) and wait_for(delivered_to(m8, opened_sessions()[2])))
     call8 = json.loads((HOME / "cli_calls.jsonl").read_text().splitlines()[2])
-    expect("T8 a program's mail without a name opens the session without --name", not any(a.startswith("--name") for a in call8["args"]), call8)
+    expect("T8 a program's mail without a name opens the session titled by its subject", call8["args"][-1] == "/rename T8 lease notice", call8)
 
     # command-line Claude not signed in: waits for the user, retried later
     (HOME / "cli_fail").touch()

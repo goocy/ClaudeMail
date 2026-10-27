@@ -21,8 +21,8 @@ On the receiving machine the dispatcher hands each message to its session:
     closed or archived      the desktop app opens it with its own link, claude://resume?session=<CLI id>, which starts
                             its process (and restores it from the archive); the message follows through the socket.
     new, or not here        the app's command-line Claude creates a session in the desk's folder with the local command
-                            /cost (no model call, no sign-in) and the proposed name (--name=), the app imports it with the
-                            same link, and the message follows through the socket.
+                            /rename <proposed name, else the subject> (no model call, no sign-in), the app imports it
+                            with the same link, and the message follows through the socket.
 The app comes to the front for each session it opens. Mail it cannot deliver within open_minutes waits for the user
 (one notification), and is tried again every retry_minutes; a session that starts running in the meantime gets it.
 
@@ -363,13 +363,16 @@ def running_sessions() -> dict:
     """{id: Claude Code's registry entry} for the Claude processes running on this machine, under the CLI session id and,
     for desktop sessions, also under the desktop id (local_...), which stays the same if the app ever gives a session a
     new CLI id. An entry whose process is gone stays behind after a crash, so the pid decides; Windows hands pids out
-    again soon, so delivery checks once more, by the socket answering."""
+    again soon, so delivery checks once more, by the socket answering. A session that is still starting has an entry
+    without its socket or its status for a moment (Stahlwerk 2026-10-27, which ended the dispatcher), and counts once
+    both are there."""
     found = {}
     if not REGISTRY_DIR.is_dir():
         return found
     for path in REGISTRY_DIR.glob("*.json"):
         entry = read_written(path)
-        if entry is None or not entry.get("messagingSocketPath") or not pid_alive(int(entry["pid"])):
+        if (entry is None or not entry.get("messagingSocketPath") or "status" not in entry
+                or not pid_alive(int(entry["pid"]))):
             continue
         for key in [entry["sessionId"]] + ([entry["hostSessionId"]] if entry.get("hostSessionId") else []):
             if key not in found or found[key]["startedAt"] < entry["startedAt"]:   # a stale file whose pid went elsewhere
@@ -809,15 +812,15 @@ def desk_folder(desk: str, desktop: dict) -> str:
     return folders[-1] if folders else ""
 
 
-def open_new_session(folder: str, session: str, name: str) -> str:
+def open_new_session(folder: str, session: str, title: str) -> str:
     """Create a session with this id in the folder and have the desktop app import it into its sidebar, which starts its
     process; the message then goes in through its inbox and the session runs on the app's own sign-in. The session is
-    created by the app's bundled command-line Claude running the local command /cost, which writes a real transcript
-    without calling the model, so the command-line Claude needs no sign-in of its own (tested on Pulvermaar 2026-10-26).
-    The sender's proposed name goes in with --name= (one argument, so a name that starts with a dash is still
-    the name) as the transcript's custom title, which the app takes as the sidebar
-    title on import and keeps after the session's first turn (tested on Pulvermaar 2026-10-27); without a name the app
-    titles the session itself.
+    created by the app's bundled command-line Claude running the local command /rename <title>, which writes a real
+    transcript without calling the model, so the command-line Claude needs no sign-in of its own (tested on Pulvermaar
+    2026-10-26 with /cost, on Stahlwerk 2026-10-27 with /rename). It writes the title into the transcript as its custom
+    title, which the app takes as the sidebar title on import and keeps after the session's first turn (tested on
+    Pulvermaar 2026-10-27), and the thread opens with "Session renamed to: <title>". The prompt is one argument starting
+    with a slash, so a title that starts with a dash is still the title.
     '' on success, else why not: each is a known condition (no app, a folder gone from this machine, the command-line
     Claude failing or hanging), and the mail then waits for the user."""
     cli = claude_cli()
@@ -826,8 +829,7 @@ def open_new_session(folder: str, session: str, name: str) -> str:
     if not Path(folder).is_dir():
         return "the desk's folder " + folder + " does not exist on this machine"
     try:
-        run = subprocess.run([str(cli), "-p", "--session-id", session] + (["--name=" + name] if name else []) + ["/cost"],
-                             cwd=folder, stdin=subprocess.DEVNULL,
+        run = subprocess.run([str(cli), "-p", "--session-id", session, "/rename " + title], cwd=folder, stdin=subprocess.DEVNULL,
                              capture_output=True, encoding="utf-8", errors="replace", timeout=60,
                              creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0))
     except subprocess.TimeoutExpired:
@@ -916,7 +918,9 @@ def deliver(machine: str, desk: str, message: Path, config: dict, running: dict,
     session = str(uuid.uuid4())
     status = dict(status, state="opening", session=session, opened=now_iso(), meant_for=header.get("for_session", ""))
     write_status(message, status)
-    why = open_new_session(folder, session, header.get("session_name", ""))
+    # The sender's proposed name is the title; mail without one (a program's, or one for a session that is not here)
+    # is titled by its subject.
+    why = open_new_session(folder, session, " ".join((header.get("session_name") or header["subject"]).split()))
     if why:
         return to_user(machine, desk, message, header, dict(status, session=""), why)
     log(machine, "opened a new session " + session[:8] + " on " + desk + " for " + message.name)
