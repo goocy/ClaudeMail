@@ -87,8 +87,10 @@ if parsed.netloc == "resume" and known:                      # a session the app
 elif parsed.netloc == "resume":
     calls = [json.loads(l) for l in (home / "cli_calls.jsonl").read_text().splitlines()]
     call = [c for c in calls if c["session"] == query["session"]][-1]
+    names = [a[len("--name="):] for a in call["args"] if a.startswith("--name=")]   # the app takes the transcript's custom title (live 2026-10-27)
     record = {"sessionId": "local_" + call["session"], "cliSessionId": call["session"], "cwd": call["cwd"],
-              "title": "Imported", "isArchived": False, "lastActivityAt": int(time.time() * 1000)}
+              "title": names[0] if names else "Imported", "isArchived": False,
+              "lastActivityAt": int(time.time() * 1000)}
     (store / (record["sessionId"] + ".json")).write_text(json.dumps(record))
 else:
     sys.exit("fake open: unexpected " + url)
@@ -225,13 +227,22 @@ try:
     expect("T5 used the import link with its CLI id", "claude://resume?session=" + B in (HOME / "opened.txt").read_text())
 
     # new session: command-line turn, import, socket
-    m6 = sent_path(run(["send", "--to", "Pulvermaar:Foo", "--new", "--subject", "T6 new", "--body-file", body("hello new")], session=S0).stdout)
+    m6 = sent_path(run(["send", "--to", "Pulvermaar:Foo", "--new", "--name", "Foo  T6\n work", "--subject", "T6 new", "--body-file", body("hello new")], session=S0).stdout)
     expect("T6 new session started by the CLI", wait_for(lambda: len(opened_sessions()) == 1))
     new6 = opened_sessions()[0]
     call = json.loads((HOME / "cli_calls.jsonl").read_text().splitlines()[0])
     expect("T6 CLI ran in the desk folder", call["cwd"] == str(FOO.resolve()) or call["cwd"] == str(FOO), call)
     expect("T6 delivered to the new session", wait_for(delivered_to(m6, new6)))
     expect("T6 text says ClaudeMail opened it", "opened this session" in (received(new6) or [""])[-1])
+    expect("T6 the proposed name went to the CLI as --name=, whitespace collapsed", "--name=Foo T6 work" in call["args"]
+           and call["args"][-1] == "/cost", call)
+    expect("T6 the new session carries the proposed title", json.loads((STORE / ("local_" + new6 + ".json")).read_text())["title"] == "Foo T6 work")
+    p = run(["send", "--to", "Pulvermaar:Foo", "--new", "--subject", "x", "--body-file", body("x")], session=S0, check=False)
+    expect("T6b a session sending --new without --name is refused", p.returncode != 0 and "--name" in p.stderr, p.stdout + p.stderr)
+    p = run(["send", "--to", "Pulvermaar:Foo", "--new", "--name", "  ", "--subject", "x", "--body-file", body("x")], session=S0, check=False)
+    expect("T6b a blank name is no name", p.returncode != 0 and "--name" in p.stderr, p.stdout + p.stderr)
+    p = run(["send", "--to", "Pulvermaar:Foo", "--for-session", A[:8], "--name", "x", "--subject", "x", "--body-file", body("x")], session=S0, check=False)
+    expect("T6c --name for an existing session is refused", p.returncode != 0 and "keeps its title" in p.stderr, p.stdout + p.stderr)
 
     # archived session: restored and delivered to itself
     m7 = sent_path(run(["send", "--to", "Pulvermaar:Foo", "--for-session", C, "--subject", "T7 archived", "--body-file", body("hello C")], session=S0).stdout)
@@ -246,10 +257,12 @@ try:
     # a program without a session gets a new session without choosing
     m8 = sent_path(run(["send", "--to", "Pulvermaar:Foo", "--to-own-desk", "--subject", "T8 lease notice", "--body-file", body("job done")]).stdout)
     expect("T8 program mail -> new session", wait_for(lambda: len(opened_sessions()) == 3) and wait_for(delivered_to(m8, opened_sessions()[2])))
+    call8 = json.loads((HOME / "cli_calls.jsonl").read_text().splitlines()[2])
+    expect("T8 a program's mail without a name opens the session without --name", not any(a.startswith("--name") for a in call8["args"]), call8)
 
     # command-line Claude not signed in: waits for the user, retried later
     (HOME / "cli_fail").touch()
-    m9 = sent_path(run(["send", "--to", "Pulvermaar:Foo", "--new", "--subject", "T9 no login", "--body-file", body("x")], session=S0).stdout)
+    m9 = sent_path(run(["send", "--to", "Pulvermaar:Foo", "--new", "--name", "-T9 leading dash", "--subject", "T9 no login", "--body-file", body("x")], session=S0).stdout)
     status9 = lambda: json.loads(m9.with_name(m9.name[:-3] + ".delivery.json").read_text()) if m9.with_name(m9.name[:-3] + ".delivery.json").exists() else {}
     expect("T9 waits for the user with the CLI's words", wait_for(lambda: status9().get("state") == "waiting for the user")
            and "Not logged in" in status9().get("reason", ""), status9())
@@ -306,11 +319,11 @@ try:
     p = run(["send", "--to", "Mistral:sample project", "--for-session", D[:8], "--subject", "T13", "--body-file", body("x")], session=S0)
     expect("T13 to another machine's session", p.returncode == 0 and D in sent_path(p.stdout).read_text()
            and "desks/Sample Project/" in sent_path(p.stdout).as_posix(), p.stdout + p.stderr)
-    p = run(["send", "--to", "Mistral:Nope", "--new", "--subject", "x", "--body-file", body("x")], session=S0, check=False)
+    p = run(["send", "--to", "Mistral:Nope", "--new", "--name", "x", "--subject", "x", "--body-file", body("x")], session=S0, check=False)
     expect("T14 unknown desk refused", p.returncode != 0 and "No desk" in p.stderr, p.stderr)
-    p = run(["send", "--to", "Moosfels", "--new", "--subject", "x", "--body-file", body("x")], session=S0, check=False)
+    p = run(["send", "--to", "Moosfels", "--new", "--name", "x", "--subject", "x", "--body-file", body("x")], session=S0, check=False)
     expect("T14b machine without a report still gets --new mail on Home", p.returncode == 0 and "Moosfels/desks/Home/" in p.stdout, p.stdout + p.stderr)
-    p = run(["send", "--to", "Moosfels:Foo", "--new", "--subject", "x", "--body-file", body("x")], session=S0, check=False)
+    p = run(["send", "--to", "Moosfels:Foo", "--new", "--name", "x", "--subject", "x", "--body-file", body("x")], session=S0, check=False)
     expect("T14c but no unknown desk there", p.returncode != 0 and "No desk" in p.stderr, p.stderr)
     (SVC / "mail/Teppich/reports").mkdir(parents=True)
     (SVC / "mail/Teppich/desks/Computers").mkdir(parents=True)
@@ -323,9 +336,9 @@ try:
     expect("T15 reply to a program refused", p.returncode != 0 and "is a program" in p.stderr, p.stderr)
     p = run(["send", "--to", "all", "--subject", "x", "--body-file", body("x")], session=S0, check=False)
     expect("T16 --to all needs --new", p.returncode != 0)
-    p = run(["send", "--to", "all", "--new", "--subject", "T16 all", "--body-file", body("x")], session=S0)
+    p = run(["send", "--to", "all", "--new", "--name", "T16", "--subject", "T16 all", "--body-file", body("x")], session=S0)
     expect("T16 --to all --new reaches every other machine's Home", p.stdout.count("sent ") == 6 and "Pulvermaar/" not in p.stdout, p.stdout)
-    p = run(["send", "--to", "Mistral:General", "--new", "--subject", "x", "--body-file", body("x")], session=S0)
+    p = run(["send", "--to", "Mistral:General", "--new", "--name", "x", "--subject", "x", "--body-file", body("x")], session=S0)
     expect("T16b General means Home", p.returncode == 0 and "desks/Home/" in p.stdout, p.stdout + p.stderr)
 
     # install-hook drops the old Stop waiter and keeps other hooks
