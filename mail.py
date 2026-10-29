@@ -131,15 +131,32 @@ def clean_desk_name(name: str) -> str:
 
 
 def desk_file_override(folder: str):
-    """The name in the nearest '.desk' file in the folder or its parents, when the folder exists on this machine."""
+    """The name in the nearest '.desk' file in the folder or its parents, when the folder exists on this machine. A
+    folder on a network share that does not answer has none: on 2026-10-28 at 17:34 a session folder on a network share
+    did not answer, and the TimeoutError of the folder check ended the dispatcher twice."""
     path = Path(folder)
-    if not path.is_absolute() or not path.is_dir():
+    try:
+        if not path.is_absolute() or not path.is_dir():
+            return None
+        for candidate in [path] + list(path.parents):
+            marker = candidate / DESK_FILE
+            if marker.is_file():
+                return clean_desk_name(marker.read_text(encoding="utf-8-sig").strip().splitlines()[0])
+    except TimeoutError:
         return None
-    for candidate in [path] + list(path.parents):
-        marker = candidate / DESK_FILE
-        if marker.is_file():
-            return clean_desk_name(marker.read_text(encoding="utf-8-sig").strip().splitlines()[0])
     return None
+
+
+DESK_CACHE = {}                                                     # folder -> desk, for the dispatcher
+
+
+def store_desk(folder: str) -> str:
+    """desk_for a folder from the app's store, worked out once per run of the process: the dispatcher looks at every
+    session's folder every few seconds, '.desk' files seldom change (a change of mail.py restarts the dispatcher), and a
+    folder on a share that does not answer then costs one timeout per run, not one per pass."""
+    if folder not in DESK_CACHE:
+        DESK_CACHE[folder] = desk_for(folder)
+    return DESK_CACHE[folder]
 
 
 def desk_for(folder: str) -> str:
@@ -388,7 +405,11 @@ def desktop_sessions() -> dict:
     archived ones included. The app keeps one store per account and organisation, and only the signed-in account's is
     the sidebar (`lastKnownAccountUuid` in its config.json). On Altiplano on 2026-10-26 several accounts' stores held 1,000
     files and 240 MB, and reading all of them every pass took the dispatcher three minutes; so only that account's
-    files are read, and each only again when it changed."""
+    files are read, and each only again when it changed.
+    A record has no cliSessionId while the session has no command-line conversation: the app drops the key when the
+    user clears the session or a resume finds no transcript (its clearStaleResumeHandle, app 4.29.0, keeping the old id
+    in priorCliSessionIds), and sets a new one when the next process starts. On Altiplano on 2026-10-28 such a record
+    (local_66ff66ff, cleared on 2026-09-29) ended the dispatcher every 30 s for ten hours."""
     config = APP_DIR / "config.json"
     if not config.is_file():
         return {}                                            # the app was never signed in here
@@ -412,8 +433,10 @@ def desktop_sessions() -> dict:
 def find_desktop(desktop: dict, session: str):
     """The app's record of a session named by its desktop id, or by its CLI id, which the app may change: on 2026-10-26
     the ClaudeMail session on Pulvermaar went from CLI id 33cc33cc to 44dd44dd as local_55ee55ee. Mail from programs
-    (LeaseResources) and from v3 names the CLI id."""
-    return desktop.get(session) or next((r for r in desktop.values() if r["cliSessionId"] == session), None)
+    (LeaseResources) and from v3 names the CLI id. A record without cliSessionId has no CLI conversation now (see
+    desktop_sessions), so no CLI id names it."""
+    return desktop.get(session) or next((r for r in desktop.values()
+                                         if "cliSessionId" in r and r["cliSessionId"] == session), None)
 
 
 def claude_cli():
@@ -537,7 +560,7 @@ def session_listing(config: dict) -> tuple:
     keep = 86400 * float(config["session_keep_days"])
     sessions, desks = [], {HOME_DESK: display(Path.home())}
     for host, record in sorted(desktop_sessions().items(), key=lambda item: item[1]["lastActivityAt"]):
-        desk = desk_for(record["cwd"])
+        desk = store_desk(record["cwd"])
         desks[desk] = record["cwd"]                          # the newest session's folder wins
         active = datetime.datetime.fromtimestamp(record["lastActivityAt"] / 1000).astimezone()
         if record["isArchived"] or time.time() - active.timestamp() > keep:
@@ -808,7 +831,7 @@ def desk_folder(desk: str, desktop: dict) -> str:
     if desk.casefold() == HOME_DESK.casefold():
         return str(Path.home())
     folders = [r["cwd"] for r in sorted(desktop.values(), key=lambda r: r["lastActivityAt"])
-               if desk_for(r["cwd"]).casefold() == desk.casefold()]
+               if store_desk(r["cwd"]).casefold() == desk.casefold()]
     return folders[-1] if folders else ""
 
 
@@ -900,6 +923,10 @@ def deliver(machine: str, desk: str, message: Path, config: dict, running: dict,
     if status["state"] == WAITING_FOR_USER and age(status["tried"]) < 60 * float(config["retry_minutes"]):
         return
     record = find_desktop(desktop, target)                   # on a retry, also the session opened for it before
+    if record is not None and "cliSessionId" not in record:
+        # A cleared session has no CLI id for the import link; once the user opens it, it runs and the post above takes it.
+        return to_user(machine, desk, message, header, status, "session " + record["sessionId"] + " (" + record.get("title", "")
+                       + ") has no conversation to resume, as the app cleared it; open it in the app and the message follows")
     if record is not None:
         # The app's import link starts the process of a session it already has, and restores an archived one. Its
         # claude://code/continue link only shows the session and starts nothing (live test on Pulvermaar, 2026-10-26).

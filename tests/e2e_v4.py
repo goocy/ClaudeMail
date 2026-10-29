@@ -80,7 +80,8 @@ if (home / "open_ignore").exists():
     sys.exit(0)
 parsed = urllib.parse.urlparse(url)
 query = dict(urllib.parse.parse_qsl(parsed.query))
-known = [p for p in store.glob("local_*.json") if json.loads(p.read_text())["cliSessionId"] == query.get("session")]
+known = [p for p in store.glob("local_*.json") if "cliSessionId" in json.loads(p.read_text())
+         and json.loads(p.read_text())["cliSessionId"] == query.get("session")]
 if parsed.netloc == "resume" and known:                      # a session the app has: restore it and start it
     record = dict(json.loads(known[0].read_text()), isArchived=False)
     known[0].write_text(json.dumps(record))
@@ -189,6 +190,10 @@ try:
     S0 = sid("9")
     store("a", FOO, "Foo feature A"); store("b", FOO, "Foo feature B"); store("c", FOO, "Old Foo", archived=True)
     store("e", FOO, "Foo feature E"); store("f", FOO, "Foo feature F"); store("9", BAR, "Bar work")
+    # a session the user cleared: the app dropped its cliSessionId and kept the old one as prior (Altiplano, 2026-10-28)
+    K = sid("k")
+    (STORE / ("local_" + K + ".json")).write_text(json.dumps({"sessionId": "local_" + K, "cwd": str(FOO), "title": "Cleared Foo",
+        "isArchived": False, "lastActivityAt": int(time.time() * 1000) - 60000, "priorCliSessionIds": [sid("j")]}))
     start_session("a", FOO)
 
     # hook and whoami
@@ -265,6 +270,14 @@ try:
     new7 = opened_sessions()[1]
     expect("T7b delivered with a note naming the missing session", wait_for(delivered_to(m7b, new7)) and G in received(new7)[-1])
     expect("T7b the new session is titled by the subject", json.loads((STORE / ("local_" + new7 + ".json")).read_text())["title"] == "T7b gone")
+    expect("T7b the search by CLI id passed the cleared session's record", dispatcher.poll() is None, (BASE / "dispatch.err").read_text())
+    # the cleared session, named by its desktop id: nothing to resume, so it waits for the user to open it
+    m7c = sent_path(run(["send", "--to", "Pulvermaar:Foo", "--for-session", "local_" + K, "--subject", "T7c cleared", "--body-file", body("x")], session=S0).stdout)
+    st7c = lambda: json.loads(m7c.with_name(m7c.name[:-3] + ".delivery.json").read_text()) if m7c.with_name(m7c.name[:-3] + ".delivery.json").exists() else {}
+    expect("T7c a cleared session waits for the user", wait_for(lambda: st7c().get("state") == "waiting for the user")
+           and "no conversation to resume" in st7c().get("reason", "") and len(opened_sessions()) == 2 and dispatcher.poll() is None, st7c())
+    start_session("k", FOO)                                 # the user opens it: the app gives it a CLI id, here the same
+    expect("T7c delivered once the user opened it", wait_for(delivered_to(m7c, K), 40))
     # a program without a session gets a new session without choosing
     m8 = sent_path(run(["send", "--to", "Pulvermaar:Foo", "--to-own-desk", "--subject", "T8 lease notice", "--body-file", body("job done")]).stdout)
     expect("T8 program mail -> new session", wait_for(lambda: len(opened_sessions()) == 3) and wait_for(delivered_to(m8, opened_sessions()[2])))
