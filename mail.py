@@ -72,7 +72,7 @@ REPORTS = "reports"
 STATUS_SUFFIX = ".delivery.json"                                    # .status.json until v3: left alone
 GROUP_FOLDERS = ["Services", "Projects", "Tools"]
 HEADER_FIELDS = ["from", "from_session", "to", "for_session", "session_name", "subject", "sent", "id", "conversation",
-                 "in_reply_to"]
+                 "in_reply_to", "protocol"]
 HOOK_EVENTS = ["SessionStart", "UserPromptSubmit"]
 TASK_NAME = "Claude Mail Watcher"
 LAUNCHD_LABEL = "com.goocy.claudemail"
@@ -87,6 +87,9 @@ DISPATCHER = "dispatcher"                                           # the sender
 DELIVER_SECONDS = 150                                               # one message's delivery, in its own process: the
                                                                     # command-line Claude alone may take 60 s, `open` 30 s
 SLIM_RECORD = ("sessionId", "cliSessionId", "title", "cwd", "lastActivityAt", "isArchived")   # what delivery reads
+REQUIRED_FIELDS = ["from", "subject", "sent", "id"]                 # what deliver needs; send checks the same
+V4_START = datetime.datetime(2026, 10, 26, 15, 48, tzinfo=datetime.timezone(datetime.timedelta(hours=-5)))
+HELD = "held"                                                       # mail from before version 4, set aside per desk
 APP_LOG = (Path(os.environ["LOCALAPPDATA"]) / "Claude" / "logs" / "main.log" if sys.platform == "win32"   # Moosfels, 2026-10-30
            else Path.home() / "Library" / "Logs" / "Claude" / "main.log")
 
@@ -306,6 +309,19 @@ def format_message(header: dict, body: str) -> str:
     return "\n".join(lines + ["---"]) + "\n\n" + body.strip() + "\n"
 
 
+def header_missing(header: dict) -> list:
+    """The fields a message must have that this header lacks or leaves blank: send refuses such a message, deliver
+    rejects one (a subject of spaces only once passed send and was rejected at the receiver, 2026-10-30)."""
+    missing = [key for key in REQUIRED_FIELDS if not header.get(key, "").strip()]
+    if "sent" not in missing:
+        try:
+            if datetime.datetime.fromisoformat(header["sent"]).tzinfo is None:
+                missing.append("a time zone in sent")
+        except ValueError:                                   # a decided response: such a header is rejected like a missing one
+            missing.append("a time in sent")
+    return missing
+
+
 def message_id(path: Path) -> str:
     return path.name[:-3] if path.name.endswith(".md") else path.name
 
@@ -323,26 +339,42 @@ def write_status(message: Path, status: dict) -> None:
     write_json(status_path(message), dict(status, updated=now_iso()))
 
 
-def new_message_id(machine: str, stamp: str, sender: str) -> str:
-    """<yyMMdd-HHmmss>-<Sender>, with -2, -3 ... when that sender already used the second on that machine. The sender
-    in the name keeps two machines that write to one mailbox in the same second from colliding in Resilio."""
-    taken = set()
-    for folder in desk_folders(machine):
-        for sub in (folder, folder / READ):
-            taken.update(message_id(p) for p in waiting_in(sub))
-    n = 1
-    while stamp + "-" + sender + ("" if n == 1 else "-" + str(n)) in taken:
-        n += 1
-    return stamp + "-" + sender + ("" if n == 1 else "-" + str(n))
+def new_message_id(sender: str) -> str:
+    """<yyMMdd-HHmmss>Z-<Sender>-<8 hex>: a UTC stamp, so ids sort right across time zones and the DST fall-back, and a
+    random part, so that every recipient of a fan-out and every one of two sends in the same second get their own id
+    on every machine (since 2026-10-30; until then a local stamp with -2, -3 checked on the target machine alone, which
+    gave a fan-out's recipients one id and let two parallel sends overwrite each other)."""
+    return datetime.datetime.now(datetime.timezone.utc).strftime("%y%m%d-%H%M%SZ") + "-" + sender + "-" + uuid.uuid4().hex[:8]
+
+
+def write_new(path: Path, text: str) -> None:
+    """Like write_atomically, but the path must be new: a hard link fails on a name that exists, where a rename would
+    replace it."""
+    path.parent.mkdir(parents=True, exist_ok=True)
+    tmp = path.with_name("." + path.name + "." + str(os.getpid()) + ".tmp")
+    with open(tmp, "w", encoding="utf-8", newline="\n") as fh:
+        fh.write(text)
+    try:
+        os.link(tmp, path)
+    finally:
+        # Resilio or a virus scanner may hold the new file for a moment, and on Windows that holds the temp name too
+        # (both are the same file), so its removal is tried for up to three seconds, as move() does.
+        for attempt in range(30):
+            try:
+                tmp.unlink()
+                break
+            except PermissionError:
+                assert attempt < 29, "could not remove " + str(tmp)
+                time.sleep(0.1)
 
 
 def find_message(given: str) -> Path:
     """The one message a path or id names. A path that is a file is that message. A path that is not (the message has
     since been delivered into read/, or the path was written on another machine) names the machine and desk below
     'desks', and the message is looked up by its id on that desk, undelivered or delivered. A bare id is looked up on
-    every machine. An id is unique on one machine (new_message_id) but not across machines: a sender's fan-out within
-    one second gives each recipient the same id (261030-004134-Mistral on six machines, 2026-10-30), so more than one
-    match is refused with every matching path."""
+    every machine. Since 2026-10-30 every id is unique everywhere (new_message_id); older ids were unique on one machine
+    only, and a sender's fan-out within one second gave each recipient the same id (261030-004134-Mistral on six
+    machines), so more than one match is refused with every matching path."""
     path = Path(given)
     for candidate in ([path] if path.is_absolute() else [MAILBOX_ROOT / given, Path.cwd() / given]):
         if candidate.is_file():
@@ -734,7 +766,8 @@ def cmd_sessions(args, config: dict) -> None:
 
 def cmd_send(args, config: dict) -> None:
     sender, sender_desk, sender_session = session_desk(config)
-    header = {"from": sender + ":" + sender_desk, "from_session": sender_session, "subject": args.subject or ""}
+    header = {"from": sender + ":" + sender_desk, "from_session": sender_session, "subject": " ".join((args.subject or "").split()),
+              "protocol": str(PROTOCOL)}
     if args.reply_to:
         assert not args.to and args.for_session is None and not args.new, "--reply-to goes back to the sender alone"
         original, _ = read_message(find_message(args.reply_to))
@@ -774,17 +807,31 @@ def cmd_send(args, config: dict) -> None:
         body = Path(args.body_file).read_text(encoding="utf-8") if args.body_file else sys.stdin.read()
     if not body.strip():
         raise SystemExit("Empty body.")
-    stamp = datetime.datetime.now().strftime("%y%m%d-%H%M%S")
     header["sent"] = now_iso()
+    # Every file is written before anything is printed: output cut short (PowerShell's Select-Object -First ends the
+    # process once it has its lines) must not leave a fan-out half sent.
+    letters = []
     for machine, desk, session in recipients:
-        ident = new_message_id(machine, stamp, sender)
+        ident = new_message_id(sender)
         fields = dict(header, to=machine + ":" + desk, id=ident, for_session=session)
         fields.setdefault("conversation", ident)
-        path = desk_dir(machine, desk) / (ident + ".md")
-        write_atomically(path, format_message(fields, body))
-        print("sent " + display(path))
-        print("  to " + (("session " + session) if session else "a new session" + (" '" + name + "'" if name else ""))
-              + " on " + machine + ":" + desk + "; "
+        text = format_message(fields, body)
+        missing = header_missing(parse_message(text)[0])
+        assert not missing, "a message without " + ", ".join(missing) + " would be rejected by its receiver"
+        letters.append((machine, desk, session, desk_dir(machine, desk) / (ident + ".md"), text))
+    written = []
+    try:
+        for machine, desk, session, path, text in letters:
+            write_new(path, text)
+            written.append((machine, desk, session, path))
+    finally:
+        if len(written) < len(letters):                      # a write failed: say what did go out, then the error
+            print("NOT ALL SENT. Sent " + str(len(written)) + " of " + str(len(letters)) + ":")
+            for machine, desk, session, path in written:
+                print("sent " + display(path) + " (" + machine + ":" + desk + ")")
+    for machine, desk, session, path, _ in letters:
+        print("sent " + display(path) + "\n  to " + (("session " + session) if session else "a new session"
+              + (" '" + name + "'" if name else "")) + " on " + machine + ":" + desk + "; "
               + (dispatcher_warning(machine, config) or machine + "'s dispatcher delivers it within seconds of the file arriving there"))
 
 
@@ -807,6 +854,10 @@ def resolve_recipients(args, config: dict, sender: str, sender_session: str) -> 
         machine = canonical_machine(machine_part, config)
         view = machine_view(machine, config)
         desk = find_desk_name(desk_part or HOME_DESK, view["desks"])
+        synced = tree_folders(desk_part.strip()) if desk is None and desk_part.strip() else []
+        if len(synced) == 1:                                 # a project of the synced tree is a desk on every machine
+            desk = desk_for(synced[0])
+            view["desks"][desk] = synced[0]
         if desk is None:
             raise SystemExit("No desk '" + desk_part.strip() + "' on " + machine + ": no session has run in that project"
                              + " there. Its desks: " + ", ".join(sorted(view["desks"])) + ".\nSend to " + machine
@@ -815,9 +866,11 @@ def resolve_recipients(args, config: dict, sender: str, sender_session: str) -> 
             recipients.append((machine, desk, ""))
             continue
         if args.for_session is None:
+            why = ("Not sent. Pick the session this is for, by its id below: --for-session <id>; or --new for a new"
+                   " session in " + view["desks"][desk] + " on " + machine + ".")
+            print(why)                                       # first, so output cut short still says why
             print_sessions(machine, view, desk)
-            raise SystemExit("\nNot sent. Pick the session this is for, by its id above: --for-session <id>; or --new"
-                             " for a new session in " + view["desks"][desk] + " on " + machine + ".")
+            raise SystemExit(why)
         wanted = clean_id(args.for_session)
         matches = [s for s in view["sessions"] if bare_id(s["session"]).startswith(bare_id(wanted)) and len(bare_id(wanted)) >= 8]
         if len(matches) == 1:
@@ -825,9 +878,11 @@ def resolve_recipients(args, config: dict, sender: str, sender_session: str) -> 
         elif len(bare_id(wanted)) == 36 and not matches:     # archived, idle for long, or a CLI id: the dispatcher sees to it
             recipients.append((machine, desk, wanted))
         else:
+            why = ("Not sent: '" + args.for_session + "' names " + str(len(matches)) + " of the sessions listed below;"
+                   " give at least eight characters of one id, or its full id.")
+            print(why)
             print_sessions(machine, view, desk)
-            raise SystemExit("\nNot sent: '" + args.for_session + "' names " + str(len(matches)) + " of the sessions above;"
-                             " give at least eight characters of one id, or its full id.")
+            raise SystemExit(why)
         if recipients[-1][2] in (sender_session, clean_id(os.environ.get("CLAUDE_CODE_SESSION_ID", ""))):
             raise SystemExit("That is this session itself.")
     return recipients
@@ -924,6 +979,9 @@ def desk_folder(desk: str, desktop: dict) -> tuple:
         return synced[0], ""
     folders = [r["cwd"] for r in sorted(desktop.values(), key=lambda r: r["lastActivityAt"])
                if store_desk(r["cwd"]).casefold() == desk.casefold()]
+    if folders and MAILBOX_ROOT.resolve() in Path(folders[-1]).resolve().parents:
+        return "", ("the desk " + desk + " was last used in " + folders[-1] + ", inside ClaudeMail's mailbox (a retired"
+                    " role's folder), where no session is started")
     if folders:
         return folders[-1], ""
     return "", ("the desk " + desk + " is no folder of the synced tree here and no desktop session has run on it, so"
@@ -968,8 +1026,7 @@ def notice_to_sender(machine: str, desk: str, message: Path, header: dict, what:
     sender_machine, _, sender_desk = header["from"].partition(":")
     if not sender_desk or not machine_dir(sender_machine).is_dir():      # a header naming no machine of the house
         return log(machine, "no notice for " + message.name + ": its sender " + header["from"] + " has no mailbox here")
-    stamp = datetime.datetime.now().strftime("%y%m%d-%H%M%S")
-    ident = new_message_id(sender_machine, stamp, machine)
+    ident = new_message_id(machine)
     subject = header.get("subject", "")
     fields = {"from": machine + ":" + DISPATCHER, "to": sender_machine + ":" + sender_desk, "for_session": header["from_session"],
               "subject": "ClaudeMail notice: " + (subject or message.name), "sent": now_iso(), "id": ident,
@@ -979,7 +1036,7 @@ def notice_to_sender(machine: str, desk: str, message: Path, header: dict, what:
             + ".\n\n" + advice + "\n\nThe user ruled on 2026-10-20 (D-261012-2) that such mail comes back to the session"
             " that sent it, which tries to get it delivered itself before it tells the user.")
     path = desk_dir(sender_machine, sender_desk) / (ident + ".md")
-    write_atomically(path, format_message({k: v for k, v in fields.items() if v}, body))
+    write_new(path, format_message({k: v for k, v in fields.items() if v}, body))
     log(machine, "notice to " + header["from"] + " (" + header["from_session"][:14] + ") about " + message.name + ": " + what)
 
 
@@ -1052,9 +1109,22 @@ def deliver(machine: str, desk: str, message: Path, config: dict, running: dict,
         header, _ = read_message(message)
     except UnicodeDecodeError:
         return reject(machine, desk, message, "it is not UTF-8 text", {})
-    missing = [key for key in ("from", "subject", "sent", "id") if not header.get(key)]
+    missing = header_missing(header)
     if missing:
         return reject(machine, desk, message, "its header lacks " + ", ".join(missing), header)
+    if datetime.datetime.fromisoformat(header["sent"]) < V4_START:
+        # Mail from before version 4 (2026-10-26 20:48 UTC) speaks to retired roles (the Post office's nudges) and was
+        # moved to held/ on every machine that saw the switch; a machine that did not (Sandbank, whose sync split)
+        # delivered such mail into new sessions on 2026-10-29, which acted the Post office out. Each machine now holds
+        # it itself, where it lies.
+        target = message.parent / HELD / message.name
+        target.parent.mkdir(exist_ok=True)
+        if status_path(message).is_file():
+            move(status_path(message), status_path(target))
+        move(message, target)
+        # No notice to its sender: the sessions that sent such mail are a month old, and a notice would wake them for
+        # nothing. The report counts held mail (undelivered.held) instead.
+        return log(machine, "held " + message.name + " on " + desk + ": sent " + header["sent"] + ", before version 4")
     status = read_status(message)
     if not status:
         status = {"state": "new", "arrived": now_iso()}
@@ -1158,7 +1228,8 @@ def undelivered(machine: str) -> dict:
     waiting = [(read_status(p), p) for p in messages if status_path(p).is_file()]
     found = {"count": len(messages), "unseen": len(messages) - len(waiting),
              "waiting_for_user": sum(st["state"] == WAITING_FOR_USER for st, _ in waiting),
-             "failed": sum(st["state"] == FAILED for st, _ in waiting)}
+             "failed": sum(st["state"] == FAILED for st, _ in waiting),
+             "held": sum(1 for f in desk_folders(machine) for p in waiting_in(f / HELD))}
     if waiting:
         status, path = max(waiting, key=lambda item: age(item[0]["arrived"]))
         found.update(oldest=message_id(path), oldest_arrived=status["arrived"], oldest_desk=path.parent.name)

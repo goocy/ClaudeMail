@@ -38,6 +38,8 @@ cfg.update(poll_seconds=0.5, open_minutes=0.1, retry_minutes=0.2)
 (SVC / "config" / "defaults.json").write_text(json.dumps(cfg))
 FOO, BAR = ROOT / "Projects" / "260101 Foo", ROOT / "Services" / "Bar"
 FOO.mkdir(parents=True), BAR.mkdir(parents=True)
+BAZ = ROOT / "Projects" / "260202 Baz"                                  # a project no session has run in yet (TC5)
+BAZ.mkdir(parents=True)
 PY = sys.executable
 
 # ---- fakes
@@ -375,8 +377,10 @@ try:
     expect("T14 unknown desk refused", p.returncode != 0 and "No desk" in p.stderr, p.stderr)
     p = run(["send", "--to", "Moosfels", "--new", "--name", "x", "--subject", "x", "--body-file", body("x")], session=S0, check=False)
     expect("T14b machine without a report still gets --new mail on Home", p.returncode == 0 and "Moosfels/desks/Home/" in p.stdout, p.stdout + p.stderr)
+    p = run(["send", "--to", "Moosfels:Nowhere", "--new", "--name", "x", "--subject", "x", "--body-file", body("x")], session=S0, check=False)
+    expect("T14c but no desk that is neither reported nor a folder of the synced tree", p.returncode != 0 and "No desk" in p.stderr, p.stderr)
     p = run(["send", "--to", "Moosfels:Foo", "--new", "--name", "x", "--subject", "x", "--body-file", body("x")], session=S0, check=False)
-    expect("T14c but no unknown desk there", p.returncode != 0 and "No desk" in p.stderr, p.stderr)
+    expect("T14c a project of the synced tree is a desk there too", p.returncode == 0 and "Moosfels/desks/Foo/" in p.stdout, p.stdout + p.stderr)
     (SVC / "mail/Teppich/reports").mkdir(parents=True)
     (SVC / "mail/Teppich/desks/Computers").mkdir(parents=True)
     (SVC / "mail/Teppich/reports/261026-120000-000.json").write_text(json.dumps({"listening": {}, "updated": "2026-10-26T12:00:00-05:00"}))
@@ -393,6 +397,27 @@ try:
     expect("T16 --to all needs --new", p.returncode != 0)
     p = run(["send", "--to", "all", "--new", "--name", "T16", "--subject", "T16 all", "--body-file", body("x")], session=S0)
     expect("T16 --to all --new reaches every other machine's Home", p.stdout.count("sent ") == 6 and "Pulvermaar/" not in p.stdout, p.stdout)
+    ids = [Path(line.split("sent ", 1)[1].strip()).stem for line in p.stdout.splitlines() if line.startswith("sent ")]
+    first_sent = Path([line.split("sent ", 1)[1].strip() for line in p.stdout.splitlines() if line.startswith("sent ")][0])
+    expect("TC8 a sent message carries protocol: 4", "\nprotocol: 4\n" in first_sent.read_text(), first_sent.read_text()[:400])
+    expect("TC1 every recipient of a fan-out gets its own id, a UTC stamp, sender and random part",
+           len(set(ids)) == 6 and all(i[13] == "Z" and "-Pulvermaar-" in i and len(i.split("-")[-1]) == 8 for i in ids), ids)
+    pair = [subprocess.Popen([PY, "-B", str(SVC / "mail.py"), "send", "--to", "Pulvermaar:Foo", "--for-session", A[:8], "--subject",
+                              "TC2 parallel " + str(n), "--body-file", body("x")], env=dict(ENV, CLAUDE_CODE_SESSION_ID=S0),
+                             stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True) for n in (1, 2)]
+    outs = [q.communicate()[0] for q in pair]
+    paths = [sent_path(o) for o in outs if "sent " in o]
+    expect("TC2 two sends in the same second both arrive, neither overwritten", len(paths) == 2 and paths[0] != paths[1]
+           and wait_for(lambda: all((q.parent / "read" / q.name).is_file() or q.is_file() for q in paths)), outs)
+    p = run(["send", "--to", "Pulvermaar:Foo", "--for-session", A[:8], "--subject", "   ", "--body-file", body("x")], session=S0, check=False)
+    expect("TC3 a subject of spaces only is refused by send", p.returncode != 0 and "No subject" in p.stderr, p.stdout + p.stderr)
+    p = run(["send", "--to", "Pulvermaar:Foo", "--subject", "x", "--body-file", body("x")], session=S0, check=False)
+    expect("TC4 a refusal says why in its first line", p.stdout.startswith("Not sent."), p.stdout[:200])
+    calls = len(opened_sessions())
+    p = run(["send", "--to", "Pulvermaar:Baz", "--new", "--name", "TC5", "--subject", "TC5 tree desk", "--body-file", body("x")], session=S0, check=False)
+    expect("TC5 a project of the synced tree is a desk although no session ran there", p.returncode == 0 and "desks/Baz/" in p.stdout
+           and wait_for(lambda: len(opened_sessions()) > calls, 20)
+           and json.loads((HOME / "cli_calls.jsonl").read_text().splitlines()[-1])["cwd"] in (str(BAZ), str(BAZ.resolve())), p.stdout + p.stderr)
     p = run(["send", "--to", "Mistral:General", "--new", "--name", "x", "--subject", "x", "--body-file", body("x")], session=S0)
     expect("T16b General means Home", p.returncode == 0 and "desks/Home/" in p.stdout, p.stdout + p.stderr)
 
@@ -513,6 +538,30 @@ try:
     stray = SVC / "mail/Pulvermaar/desks/Bar/261030-000004-Mistral.md"
     stray.write_text("---\nfrom: Mistral:dispatcher\nto: Pulvermaar:Bar\nfor_session: " + sid("y") + "\nsubject: ClaudeMail notice: x\nsent: "
                      + sent_now + "\nid: 261030-000004-Mistral\n---\n\nnotice for a session that is not here\n")
+    old_mail = SVC / "mail/Pulvermaar/desks/Foo/260928-150047-Mistral.md"
+    old_mail.write_text("---\nfrom: Mistral:Todo\nfrom_session: x\nto: Pulvermaar:Foo\nsubject: TC6 old\nsent: 2026-09-28T15:00:47-05:00"
+                        "\nid: 260928-150047-Mistral\n---\n\nfrom version 3\n")
+    expect("TC6 mail sent before version 4 is held where it lies, not delivered", wait_for(lambda: (old_mail.parent / "held" / old_mail.name).is_file(), 20)
+           and not old_mail.exists())
+    naive = SVC / "mail/Pulvermaar/desks/Foo/261030-000006-Mistral.md"
+    naive.write_text("---\nfrom: Pulvermaar:Bar\nfrom_session: " + S0 + "\nto: Pulvermaar:Foo\nsubject: TC9 naive\nsent: 2026-10-30T10:00:00"
+                     "\nid: 261030-000006-Mistral\n---\n\nno zone\n")
+    expect("TC9 a sent time without its zone is rejected like a missing field, and the sender told",
+           wait_for(lambda: (naive.parent / "rejected" / naive.name).is_file(), 20)
+           and wait_for(lambda: any("time zone in sent" in t for t in received(S0)), 30), received(S0)[-1:])
+    role = SVC / "mail/Pulvermaar/post office"
+    role.mkdir(parents=True)
+    (role / ".desk").write_text("Post office\n")
+    (role / "CLAUDE.md").write_text("You are the Post office.\n")
+    store("r", role, "Post office")
+    roled = SVC / "mail/Pulvermaar/desks/Post office/261030-000005-Mistral.md"
+    roled.parent.mkdir(parents=True)
+    calls = len(opened_sessions())
+    roled.write_text("---\nfrom: Mistral:Home\nto: Pulvermaar:Post office\nsubject: TC7 role\nsent: " + sent_now
+                     + "\nid: 261030-000005-Mistral\n---\n\nnudge\n")
+    st7 = lambda: json.loads(roled.with_name(roled.name[:-3] + ".delivery.json").read_text()) if roled.with_name(roled.name[:-3] + ".delivery.json").exists() else {}
+    expect("TC7 no session is started in a retired role's folder inside the mailbox", wait_for(lambda: st7().get("state") == "waiting for the user", 20)
+           and "inside ClaudeMail's mailbox" in st7()["reason"] and len(opened_sessions()) == calls, st7())
     expect("TB7 a notice for a session that is not on this machine is set aside, and opens no session",
            wait_for(lambda: (stray.parent / "read" / stray.name).is_file(), 20) and len(opened_sessions()) == calls
            and json.loads((stray.parent / "read" / (stray.name[:-3] + ".delivery.json")).read_text())["state"] == "set aside")
