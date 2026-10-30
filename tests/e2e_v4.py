@@ -365,6 +365,46 @@ try:
     p = run(["send", "--to", "Mistral:General", "--new", "--name", "x", "--subject", "x", "--body-file", body("x")], session=S0)
     expect("T16b General means Home", p.returncode == 0 and "desks/Home/" in p.stdout, p.stdout + p.stderr)
 
+    # One id on three machines, as after Mistral's fan-out of 2026-10-30 (ids are unique per machine only): a path names
+    # its own message, also after it moved to read/, and a bare id is refused. Altiplano sorts first, which is the
+    # message the old lookup by bare id returned, so each check below asks for another machine's.
+    same = "261030-004134-Mistral"
+    fixture = [("Altiplano", "Home", "1", "altiplano-session"), ("Pulvermaar", "ClaudeMail", "2", "pulvermaar-session"),
+               ("Stahlwerk", "Home", "3", "")]                     # Stahlwerk's is not delivered yet: no read/, no record
+    for machine, desk, letter, delivered in fixture:
+        folder = SVC / "mail" / machine / "desks" / "Home" / ("read" if delivered else "")
+        folder.mkdir(parents=True, exist_ok=True)
+        (folder / (same + ".md")).write_text("---\nfrom: Mistral:" + desk + "\nfrom_session: " + sid(letter) + "\nto: " + machine
+                                             + ":Home\nsubject: T19 to " + machine + "\nsent: 2026-10-30T00:41:34-05:00\nid: " + same
+                                             + "\nconversation: " + same + "\n---\n\nRetire the Post office on " + machine + ".\n")
+        if delivered:
+            (folder / (same + ".delivery.json")).write_text(json.dumps({"state": "delivered", "delivered_to": delivered}))
+    p = run(["status", same], check=False)
+    expect("T19 status of an id on three machines is refused with all three paths", p.returncode != 0 and "names 3 messages" in p.stderr
+           and all("/" + m + "/desks/Home/" in p.stderr for m, _, _, _ in fixture), p.stdout + p.stderr)
+    gone = SVC / "mail/Pulvermaar/desks/Home" / (same + ".md")      # where it was before the dispatcher delivered it
+    p = run(["status", str(gone)], check=False)
+    expect("T19b status of a delivered message's old path shows that machine's message and record", p.returncode == 0
+           and p.stdout.startswith((gone.parent / "read" / gone.name).as_posix()) and "to Pulvermaar:Home" in p.stdout
+           and "pulvermaar-session" in p.stdout and "altiplano-session" not in p.stdout, p.stdout + p.stderr)
+    p = run(["status", "Pulvermaar/desks/Home/" + same + ".md"], check=False)
+    expect("T19c a path relative to the mail folder names its machine's message", p.returncode == 0
+           and "to Pulvermaar:Home" in p.stdout and "pulvermaar-session" in p.stdout, p.stdout + p.stderr)
+    p = run(["status", "/Users/someone/ResilioSync/Services/ClaudeMail/mail/Stahlwerk/desks/Home/read/" + same + ".md"], check=False)
+    expect("T19d another machine's path names the message on that machine, also when it is not in read/ yet", p.returncode == 0
+           and "to Stahlwerk:Home" in p.stdout and "not yet seen by the dispatcher" in p.stdout, p.stdout + p.stderr)
+    p = run(["status", "Moosfels/desks/Home/" + same + ".md"], check=False)
+    expect("T19e a path to a machine without that message is not found elsewhere", p.returncode != 0
+           and "No such message" in p.stderr, p.stdout + p.stderr)
+    p = run(["send", "--reply-to", same, "--body-file", body("which one?")], session=A, check=False)
+    expect("T19f reply to an id on three machines is refused, nothing sent", p.returncode != 0 and "names 3 messages" in p.stderr
+           and "sent " not in p.stdout, p.stdout + p.stderr)
+    p = run(["send", "--reply-to", str(gone), "--body-file", body("done on Pulvermaar")], session=A, check=False)
+    reply = sent_path(p.stdout) if p.returncode == 0 else Path("none")
+    expect("T19g reply to a delivered message's old path goes to that message's sender", p.returncode == 0
+           and "desks/ClaudeMail/" in reply.as_posix() and "Mistral/" in reply.as_posix() and "for_session: " + sid("2") in reply.read_text()
+           and "Re: T19 to Pulvermaar" in reply.read_text() and "in_reply_to: " + same in reply.read_text(), p.stdout + p.stderr)
+
     # install-hook drops the old Stop waiter and keeps other hooks
     (HOME / ".claude/settings.json").write_text(json.dumps({"hooks": {
         "Stop": [{"hooks": [{"type": "command", "command": "python ~/ResilioSync/Services/ClaudeMail/mail.py wait", "asyncRewake": True}]},

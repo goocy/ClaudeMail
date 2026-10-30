@@ -326,19 +326,33 @@ def new_message_id(machine: str, stamp: str, sender: str) -> str:
     return stamp + "-" + sender + ("" if n == 1 else "-" + str(n))
 
 
-def find_message(given: str):
-    """A message by path (absolute, or relative to the mail folder) or by id; undelivered copies before delivered."""
+def find_message(given: str) -> Path:
+    """The one message a path or id names. A path that is a file is that message. A path that is not (the message has
+    since been delivered into read/, or the path was written on another machine) names the machine and desk below
+    'desks', and the message is looked up by its id on that desk, undelivered or delivered. A bare id is looked up on
+    every machine. An id is unique on one machine (new_message_id) but not across machines: a sender's fan-out within
+    one second gives each recipient the same id (261030-004134-Mistral on six machines, 2026-10-30), so more than one
+    match is refused with every matching path."""
     path = Path(given)
     for candidate in ([path] if path.is_absolute() else [MAILBOX_ROOT / given, Path.cwd() / given]):
         if candidate.is_file():
             return candidate.resolve()
-    wanted = message_id(path)
-    for machine in sorted(p.name for p in MAILBOX_ROOT.iterdir() if p.is_dir()):
-        for folder in desk_folders(machine):
-            for sub in (folder, folder / READ):
-                if (sub / (wanted + ".md")).is_file():
-                    return sub / (wanted + ".md")
-    return None
+    parts = path_parts(given)
+    if not parts:
+        raise SystemExit("No message given.")
+    wanted = message_id(Path(parts[-1])) + ".md"
+    below = [i for i, part in enumerate(parts) if part.casefold() == DESKS and 0 < i < len(parts) - 2]
+    if below:
+        folders = [desk_dir(parts[below[-1] - 1], parts[below[-1] + 1])]
+    else:
+        folders = [f for m in sorted(p.name for p in MAILBOX_ROOT.iterdir() if p.is_dir()) for f in desk_folders(m)]
+    found = [sub / wanted for folder in folders for sub in (folder, folder / READ) if (sub / wanted).is_file()]
+    if not found:
+        raise SystemExit("No such message: " + given)
+    if len(found) > 1:
+        raise SystemExit("'" + given + "' names " + str(len(found)) + " messages, as ids repeat across machines. Give the"
+                         " path of the one you mean:\n" + "\n".join("  " + display(p) for p in found))
+    return found[0]
 
 
 # ---------------------------------------------------------------- Claude Code's own records
@@ -664,10 +678,7 @@ def cmd_send(args, config: dict) -> None:
     header = {"from": sender + ":" + sender_desk, "from_session": sender_session, "subject": args.subject or ""}
     if args.reply_to:
         assert not args.to and args.for_session is None and not args.new, "--reply-to goes back to the sender alone"
-        original_path = find_message(args.reply_to)
-        if original_path is None:
-            raise SystemExit("No such message: " + args.reply_to)
-        original, _ = read_message(original_path)
+        original, _ = read_message(find_message(args.reply_to))
         machine_part, _, desk_part = original["from"].partition(":")
         machine = canonical_machine(machine_part, config)
         desk = desk_part if desk_part != OLD_GENERAL else HOME_DESK
@@ -765,8 +776,6 @@ def resolve_recipients(args, config: dict, sender: str, sender_session: str) -> 
 
 def cmd_status(args, config: dict) -> None:
     path = find_message(args.message)
-    if path is None:
-        raise SystemExit("No such message: " + args.message)
     header, _ = read_message(path)
     print(display(path))
     print("  from " + header["from"] + " to " + header["to"] + ": " + header.get("subject", ""))
