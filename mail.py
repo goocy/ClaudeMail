@@ -82,6 +82,13 @@ INVALID_NAME_CHARS = '<>:"/|?*' + chr(92)
 WAITING_FOR_USER = "waiting for the user"
 PROTOCOL = 4                                                        # published in each report (design R6a, phase 1)
 CRASH_FILE = "crash.json"                                           # machine-local, while the dispatcher crash-loops
+FAILED = "failed"                                                   # a message whose delivery itself failed (design R4e)
+DISPATCHER = "dispatcher"                                           # the sender name of the dispatcher's own notices
+DELIVER_SECONDS = 150                                               # one message's delivery, in its own process: the
+                                                                    # command-line Claude alone may take 60 s, `open` 30 s
+SLIM_RECORD = ("sessionId", "cliSessionId", "title", "cwd", "lastActivityAt", "isArchived")   # what delivery reads
+APP_LOG = (Path(os.environ["LOCALAPPDATA"]) / "Claude" / "logs" / "main.log" if sys.platform == "win32"   # Moosfels, 2026-10-30
+           else Path.home() / "Library" / "Logs" / "Claude" / "main.log")
 
 
 # ---------------------------------------------------------------- config and machine
@@ -854,12 +861,17 @@ def cmd_inbox(args, config: dict) -> None:
 
 # ---------------------------------------------------------------- delivery
 
-def delivery_text(machine: str, desk: str, path: Path, text: str, config: dict, meant_for: str, opened: bool) -> str:
+def delivery_text(machine: str, desk: str, path: Path, text: str, config: dict, meant_for: str, opened: bool,
+                  meant_account: str) -> str:
     """What the session is given: who it is from, what to do with it, how to answer, and the message."""
     header, body = parse_message(text)
     parts = ["ClaudeMail: a message for this session (" + machine + ":" + desk + ")."
              + (" ClaudeMail opened this session for it." if opened else "")]
-    if meant_for:
+    if meant_for and meant_account:
+        parts.append("It was sent to session " + meant_for + ", which belongs to another account on this machine ("
+                     + meant_account + "), not the one signed in, so it came to a new session in the same project. That"
+                     " session's transcript is still on disk; look at its work where it matters.")
+    elif meant_for:
         parts.append("It was sent to session " + meant_for + ", which is not on this machine any more, so it"
                      " came to a new session in the same project. Look at that session's work where it matters.")
     parts += [
@@ -946,13 +958,91 @@ def open_new_session(folder: str, session: str, title: str) -> str:
     return open_link("claude://resume?session=" + session)
 
 
-def reject(machine: str, desk: str, message: Path, why: str) -> None:
+def notice_to_sender(machine: str, desk: str, message: Path, header: dict, what: str, advice: str) -> None:
+    """The user's ruling D-261012-2, answered 2026-10-20: "option 1 - and ideally this can be resolved without me". Mail
+    that cannot be delivered goes back as a short notice to the session that sent it, which is woken by it and tries to
+    get the mail delivered itself before it tells the user. Mail from a program (no from_session) gets none, nor does a
+    notice: they are the dispatcher's own, and a reply to them is refused (it is a program)."""
+    if not header.get("from_session") or not header.get("from") or header["from"].endswith(":" + DISPATCHER):
+        return
+    sender_machine, _, sender_desk = header["from"].partition(":")
+    if not sender_desk or not machine_dir(sender_machine).is_dir():      # a header naming no machine of the house
+        return log(machine, "no notice for " + message.name + ": its sender " + header["from"] + " has no mailbox here")
+    stamp = datetime.datetime.now().strftime("%y%m%d-%H%M%S")
+    ident = new_message_id(sender_machine, stamp, machine)
+    subject = header.get("subject", "")
+    fields = {"from": machine + ":" + DISPATCHER, "to": sender_machine + ":" + sender_desk, "for_session": header["from_session"],
+              "subject": "ClaudeMail notice: " + (subject or message.name), "sent": now_iso(), "id": ident,
+              "conversation": header.get("conversation") or header.get("id") or ident, "in_reply_to": header.get("id", "")}
+    body = ("Automatic notice from ClaudeMail on " + machine + "; a reply to it is not possible. Your message "
+            + display(message) + " to " + machine + ":" + desk + (" ('" + subject + "')" if subject else "") + " " + what
+            + ".\n\n" + advice + "\n\nThe user ruled on 2026-10-20 (D-261012-2) that such mail comes back to the session"
+            " that sent it, which tries to get it delivered itself before it tells the user.")
+    path = desk_dir(sender_machine, sender_desk) / (ident + ".md")
+    write_atomically(path, format_message({k: v for k, v in fields.items() if v}, body))
+    log(machine, "notice to " + header["from"] + " (" + header["from_session"][:14] + ") about " + message.name + ": " + what)
+
+
+def reject(machine: str, desk: str, message: Path, why: str, header: dict) -> None:
     """A file on a desk that is no message (no header, not UTF-8) goes to rejected/ beside it, so it cannot stop the
-    dispatcher, and the user is told once."""
+    dispatcher, and the user is told once; its sender, when the header names one, gets a notice."""
     target = message.parent / "rejected" / message.name
     target.parent.mkdir(exist_ok=True)
     move(message, target)
     notify(machine, "Claude mail rejected on " + desk, message.name + ": " + why + ". Moved to " + display(target) + ".")
+    notice_to_sender(machine, desk, target, header, "was rejected: " + why + "; nothing was delivered",
+                     "Fix what is named and send it again.")
+
+
+def desktop_processes(running: dict) -> int:
+    """How many desktop sessions have a process now: the app's cap counts them (8 on Altiplano, 10 on Moosfels)."""
+    return len({entry["pid"] for entry in running.values() if entry.get("entrypoint") == "claude-desktop"})
+
+
+def app_log_says(host: str) -> str:
+    """What the desktop app logged after it was asked to start this session, from the end of its log: undocumented
+    lines, read only to say more in a reason (app 4.29: "[CliGovernor] at cap; yielding warm spawn" when its process cap
+    refused the start, "Skipping warm" with why, "warmed successfully"). '' when there is no log or no such line."""
+    if not APP_LOG.is_file():
+        return ""
+    with open(APP_LOG, "rb") as fh:
+        fh.seek(max(0, APP_LOG.stat().st_size - 4_000_000))
+        lines = fh.read().decode("utf-8", "replace").splitlines()
+    starts = [i for i, line in enumerate(lines) if "Warming session " + host in line]
+    if not starts:
+        return ""
+    for line in lines[starts[-1] + 1: starts[-1] + 6]:
+        for words in ("yielding warm spawn", "Skipping warm", "warmed successfully"):
+            if words in line:
+                return " ".join(line[line.index(words):].split())[:160]
+    return ""
+
+
+def not_started(status: dict, running: dict, desktop: dict, config: dict) -> str:
+    """Why a session opened for a message has no process after open_minutes, as far as this machine can see: the app
+    did not start it. Its process cap is the usual cause (design R2b): a start that carries no typed message is
+    dropped while the app runs as many sessions as its memory allows, and the user's typed starts go over that cap."""
+    record = find_desktop(desktop, status["host"] if status.get("host") else status["session"])
+    said = app_log_says(record["sessionId"]) if record is not None else "the app has no record of it"
+    return ("the app did not start the session within " + str(config["open_minutes"]) + " minutes of being opened ("
+            + str(desktop_processes(running)) + " of its sessions have a process"
+            + ("; the app's log: " + said if said else "") + "); open it in the app, or close idle sessions")
+
+
+def other_account(session: str) -> str:
+    """The account folder of the app's store that holds this session when it is not the signed-in account's, else ''.
+    After the signed-in account changed on Altiplano on 2026-10-28, mail for a session of the old one waited 26 hours with
+    a wrong reason. Read only on this rare path: the stores of other accounts can be large."""
+    config = APP_DIR / "config.json"
+    if not session or not config.is_file():
+        return ""
+    signed_in, bare = read_json(config)["lastKnownAccountUuid"], bare_id(session)
+    for path in (APP_DIR / "claude-code-sessions").glob("*/*/" + DESKTOP_PREFIX + "*.json"):
+        account = path.parent.parent.name
+        if account != signed_in and (path.stem == DESKTOP_PREFIX + bare
+                                     or '"' + bare + '"' in path.read_text(encoding="utf-8", errors="replace")):
+            return account
+    return ""
 
 
 def deliver(machine: str, desk: str, message: Path, config: dict, running: dict, desktop: dict) -> None:
@@ -961,10 +1051,10 @@ def deliver(machine: str, desk: str, message: Path, config: dict, running: dict,
     try:
         header, _ = read_message(message)
     except UnicodeDecodeError:
-        return reject(machine, desk, message, "it is not UTF-8 text")
+        return reject(machine, desk, message, "it is not UTF-8 text", {})
     missing = [key for key in ("from", "subject", "sent", "id") if not header.get(key)]
     if missing:
-        return reject(machine, desk, message, "its header lacks " + ", ".join(missing))
+        return reject(machine, desk, message, "its header lacks " + ", ".join(missing), header)
     status = read_status(message)
     if not status:
         status = {"state": "new", "arrived": now_iso()}
@@ -981,7 +1071,8 @@ def deliver(machine: str, desk: str, message: Path, config: dict, running: dict,
     if entry is not None:
         claimed = message.parent / READ / message.name
         payload = inbox_payload(entry, delivery_text(machine, desk, claimed, message.read_text(encoding="utf-8"), config,
-                                                     status.get("meant_for", ""), "opened" in status))
+                                                     status.get("meant_for", ""), "opened" in status,
+                                                     status.get("meant_account", "")))
         claimed.parent.mkdir(exist_ok=True)
         move(message, claimed)                               # the claim: delivered at most once, even by two dispatchers
         try:
@@ -1001,11 +1092,18 @@ def deliver(machine: str, desk: str, message: Path, config: dict, running: dict,
     if status["state"] == "opening" and age(status["opened"]) < 60 * float(config["open_minutes"]):
         return
     if status["state"] == "opening":
-        return to_user(machine, desk, message, header, status, "the session did not start within "
-                       + str(config["open_minutes"]) + " minutes of being opened")
+        return to_user(machine, desk, message, header, status, not_started(status, running, desktop, config))
     if status["state"] == WAITING_FOR_USER and age(status["tried"]) < 60 * float(config["retry_minutes"]):
         return
     record = find_desktop(desktop, target)                   # on a retry, also the session opened for it before
+    if record is None and header["from"].endswith(":" + DISPATCHER):
+        # A notice for a session this machine does not have (a terminal or headless one) would only open a new session
+        # that knows nothing of the mail it is about; it is set aside instead.
+        claimed = message.parent / READ / message.name
+        claimed.parent.mkdir(exist_ok=True)
+        move(message, claimed)
+        write_status(claimed, dict(status, state="set aside", reason="a notice for a session that is not on this machine"))
+        return log(machine, "set aside the notice " + message.name + ": session " + target + " is not on this machine")
     if record is not None and "cliSessionId" not in record:
         # A cleared session has no CLI id for the import link; once the user opens it, it runs and the post above takes it.
         return to_user(machine, desk, message, header, status, "session " + record["sessionId"] + " (" + record.get("title", "")
@@ -1025,14 +1123,16 @@ def deliver(machine: str, desk: str, message: Path, config: dict, running: dict,
     # The id is written down before the command-line Claude runs, so a dispatcher that dies meanwhile finds that
     # session on its next pass instead of opening another.
     session = str(uuid.uuid4())
-    status = dict(status, state="opening", session=session, opened=now_iso(), meant_for=header.get("for_session", ""))
+    status = dict(status, state="opening", session=session, opened=now_iso(), meant_for=header.get("for_session", ""),
+                  meant_account=other_account(header.get("for_session", "")))
     write_status(message, status)
     # The sender's proposed name is the title; mail without one (a program's, or one for a session that is not here)
     # is titled by its subject.
     why = open_new_session(folder, session, " ".join((header.get("session_name") or header["subject"]).split()))
     if why:
         return to_user(machine, desk, message, header, dict(status, session=""), why)
-    log(machine, "opened a new session " + session[:8] + " on " + desk + " for " + message.name)
+    log(machine, "opened a new session " + session[:8] + " on " + desk + " for " + message.name
+        + (" (the session it names is under the account " + status["meant_account"] + ")" if status["meant_account"] else ""))
 
 
 def to_user(machine: str, desk: str, message: Path, header: dict, status: dict, why: str) -> None:
@@ -1044,6 +1144,11 @@ def to_user(machine: str, desk: str, message: Path, header: dict, status: dict, 
     if first:
         notify(machine, "Claude mail waits on " + desk, "From " + header["from"] + ": " + header.get("subject", "")
                + "\n" + why + ". `mail.py inbox` lists it.")
+        notice_to_sender(machine, desk, message, header, "waits for the user on " + machine + ": " + why,
+                         "Try to get it delivered another way first: send it again with --for-session to a session that"
+                         " runs there (`mail.py sessions " + machine + ":" + desk + "` lists them) or with --new, or ask"
+                         " the user to open the session it waits for. It is tried again every hour meanwhile; if you send"
+                         " it again, say so in your copy, since this one may still arrive.")
 
 
 def undelivered(machine: str) -> dict:
@@ -1052,7 +1157,8 @@ def undelivered(machine: str) -> dict:
     messages = [p for f in desk_folders(machine) for p in waiting_in(f)]
     waiting = [(read_status(p), p) for p in messages if status_path(p).is_file()]
     found = {"count": len(messages), "unseen": len(messages) - len(waiting),
-             "waiting_for_user": sum(st["state"] == WAITING_FOR_USER for st, _ in waiting)}
+             "waiting_for_user": sum(st["state"] == WAITING_FOR_USER for st, _ in waiting),
+             "failed": sum(st["state"] == FAILED for st, _ in waiting)}
     if waiting:
         status, path = max(waiting, key=lambda item: age(item[0]["arrived"]))
         found.update(oldest=message_id(path), oldest_arrived=status["arrived"], oldest_desk=path.parent.name)
@@ -1149,7 +1255,8 @@ def record_crash(machine: str, version: str, error: Exception, config: dict) -> 
     senders, the hook and the supervisor see a crash loop instead of a silent machine (Altiplano 2026-10-28, 1,204
     restarts and no report for 10.5 hours). The traceback goes to the watcher's log, as before."""
     ours = (Path(__file__).name, "signed_mail.py")
-    frame = [f for f in traceback.extract_tb(error.__traceback__) if Path(f.filename).name in ours][-1]
+    frame = [f for f in traceback.extract_tb(error.__traceback__)            # a named function, not a <lambda> in it
+             if Path(f.filename).name in ours and not f.name.startswith("<")][-1]
     signature = type(error).__name__ + " at " + Path(frame.filename).name + ":" + str(frame.lineno) + " in " + frame.name
     path = LOCAL_DIR / CRASH_FILE
     crash = read_json(path) if path.is_file() else {"signature": ""}          # "": no crash on record
@@ -1199,6 +1306,113 @@ def cmd_dispatch(args, config: dict) -> None:
         raise
 
 
+def failure_signature(code: int, stderr: str) -> str:
+    """'KeyError at mail.py:452 in find_desktop' from a child's traceback: the exception and the innermost frame in
+    ClaudeMail's own code; a child that ended without one (killed, out of memory) is named by its exit code."""
+    lines = [line for line in stderr.splitlines() if line.strip()]
+    frames = [line.strip() for line in lines if line.strip().startswith('File "')
+              and Path(line.strip().split('"')[1]).name in (Path(__file__).name, "signed_mail.py")
+              and not line.strip().partition(", in ")[2].startswith("<")]
+    if not frames:
+        return "exit code " + str(code) + (": " + " ".join(lines[-1].split())[:120] if lines else ", no traceback")
+    name = Path(frames[-1].split('"')[1]).name
+    number, _, function = frames[-1].partition(", line ")[2].partition(", in ")
+    return lines[-1].partition(":")[0].strip() + " at " + name + ":" + number + " in " + function.strip()
+
+
+def due(message: Path, status: dict, running: dict, version: str, config: dict) -> bool:
+    """Whether a pass has anything to do for this message, decided in the dispatcher so that mail that only waits costs
+    no process: a failed one waits for new code, an opening or waiting one for its session to run or its timer."""
+    if not status:
+        return True
+    if status["state"] == FAILED:
+        return status["version"] != version
+    target = status.get("session") or read_message(message)[0].get("for_session", "")
+    if target in running or status.get("host", "") in running:
+        return True
+    if status["state"] == "opening":
+        return age(status["opened"]) >= 60 * float(config["open_minutes"])
+    if status["state"] == WAITING_FOR_USER:
+        return age(status["tried"]) >= 60 * float(config["retry_minutes"])
+    return True
+
+
+def deliver_isolated(machine: str, desk: str, message: Path, running: dict, desktop: dict, version: str, config: dict) -> None:
+    """One message is delivered by its own short-lived process, `mail.py deliver-one`, given the snapshot and the config
+    it needs on stdin, so that a fault in delivering it fails that message and not the machine (design R4e, decided with
+    the user on 2026-10-30: "Yes, do both"; on 2026-10-28 one record stopped all mail on Altiplano for 10 hours and on
+    Mistral for 32). A failed message is not tried again on the same code; a change of mail.py tries it once more. A
+    child that fails outside `deliver` (a mail.py half written by Resilio, a broken config) would fail every message
+    alike: that ends the dispatcher instead, so the crash loop shows and no message is marked."""
+    status = read_status(message)
+    if not due(message, status, running, version, config):
+        return
+    write_json(local_heartbeat(), {"pid": os.getpid(), "version": version, "updated": now_iso()})   # children may be slow
+    job = {"machine": machine, "desk": desk, "message": str(message), "running": running, "desks": DESK_CACHE,
+           "config": config, "desktop": {k: {f: r[f] for f in SLIM_RECORD if f in r} for k, r in desktop.items()}}
+    try:
+        run = subprocess.run([sys.executable, "-B", str(Path(__file__).resolve()), "deliver-one"],
+                             input=json.dumps(job, ensure_ascii=True), capture_output=True, encoding="utf-8",
+                             errors="replace", timeout=DELIVER_SECONDS, creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0))
+    except subprocess.TimeoutExpired:
+        if message.is_file():                                # not claimed: it waits, and is tried again in an hour
+            header, _ = read_message(message)
+            return to_user(machine, desk, message, header, read_status(message),
+                           "its delivery did not end within " + str(DELIVER_SECONDS) + " s")
+        return delivery_failed(machine, desk, message, version, "no end within " + str(DELIVER_SECONDS) + " s", "")
+    if run.returncode == 0:
+        return
+    if "Traceback" in run.stderr and ", in deliver\n" not in run.stderr.replace("\r\n", "\n"):
+        raise RuntimeError("deliver-one failed outside delivery, which would fail every message: "
+                           + failure_signature(run.returncode, run.stderr) + "\n" + run.stderr[-2000:])
+    delivery_failed(machine, desk, message, version, failure_signature(run.returncode, run.stderr), run.stderr)
+
+
+def delivery_failed(machine: str, desk: str, message: Path, version: str, signature: str, stderr: str) -> None:
+    """The message's record says failed, with the traceback; the user is notified once per kind of failure and code
+    version, and the sender gets a notice. The child may have moved the message on before it failed: into read/ (it
+    claimed it for delivery, and the post may have gone through) or into rejected/. A claimed one is marked and stays
+    out of the desk, so it is never delivered twice; a rejected one is left as it is; one that vanished (deleted, or a
+    second dispatcher took it) is only logged."""
+    places = [p for p in (message, message.parent / READ / message.name, message.parent / "rejected" / message.name) if p.is_file()]
+    if not places:
+        return log(machine, "ERROR delivering " + message.name + " on " + desk + " failed (" + signature + "), and it is gone")
+    assert len(places) == 1, "one message in two places: " + ", ".join(str(p) for p in places)
+    path = places[0]
+    log(machine, "ERROR delivering " + message.name + " on " + desk + " failed: " + signature
+        + ("\n" + stderr[-3000:] if stderr else ""))
+    if path.parent.name == "rejected":
+        return
+    if path != message and status_path(message).is_file():   # the record stayed on the desk when the child claimed it
+        move(status_path(message), status_path(path))
+    status = read_status(path) or {"arrived": now_iso()}       # it failed before its first record: it arrived now
+    write_status(path, dict(status, state=FAILED, signature=signature, error=stderr[-2000:], version=version, failed=now_iso()))
+    told = LOCAL_DIR / "failures.json"
+    seen = read_json(told) if told.is_file() else {"version": "", "signatures": []}   # "": none told yet
+    if seen["version"] != version:
+        seen = {"version": version, "signatures": []}
+    if signature not in seen["signatures"]:
+        notify(machine, "Claude mail failed on " + desk, message.name + ": " + signature + ". `mail.py inbox` lists it.")
+        write_json(told, dict(seen, signatures=seen["signatures"] + [signature]))
+    header, _ = parse_message(path.read_bytes().decode("utf-8", "replace"))
+    if path == message:
+        notice_to_sender(machine, desk, path, header, "could not be delivered: ClaudeMail itself failed on it (" + signature + ")",
+                         "The user is notified. It is tried again when ClaudeMail's code changes; nothing else needs doing"
+                         " unless the message is urgent, in which case tell the user.")
+    else:
+        notice_to_sender(machine, desk, path, header, "may or may not have reached its session: ClaudeMail failed on it after"
+                         " claiming it for delivery (" + signature + ")",
+                         "It is not tried again, so that it is never delivered twice. Ask the session that should have it"
+                         " whether it did, or send it again if it matters.")
+
+
+def cmd_deliver_one(args, config: dict) -> None:
+    """The child of deliver_isolated: one message, from the snapshot on stdin. Its failure ends only this process."""
+    job = json.loads(sys.stdin.read())
+    DESK_CACHE.update(job["desks"])
+    deliver(job["machine"], job["desk"], Path(job["message"]), job["config"], job["running"], job["desktop"])
+
+
 def dispatch_loop(machine: str, version: str) -> None:
     """Deliver, then report. A report is written when what senders rely on changes (the sessions, their titles and
     whether they run, the desks, the undelivered mail, the dispatcher's own state), else every report_minutes: one a
@@ -1210,7 +1424,7 @@ def dispatch_loop(machine: str, version: str) -> None:
         running, desktop = running_sessions(), desktop_sessions()
         for folder in desk_folders(machine):
             for message in waiting_in(folder):
-                deliver(machine, folder.name, message, config, running, desktop)
+                deliver_isolated(machine, folder.name, message, running, desktop, version, config)
         new_code = code_version() != version
         if new_code and code_compiles():
             log(machine, "mail.py changed; dispatcher restarting onto the new code")
@@ -1282,6 +1496,9 @@ def check_dispatcher(machine: str, config: dict) -> None:
     if marker.is_file() and age(read_json(marker)["at"]) < 60 * float(config["kick_every_minutes"]):
         return
     write_json(marker, {"at": now_iso()})
+    if not looping:
+        log(machine, "the dispatcher has not reported for " + (str(int(age(read_json(beat)["updated"]) // 60)) + " minutes"
+                                                              if beat.is_file() else "ever") + "; restarting its watcher")
     if looping:
         print("ClaudeMail on " + machine + ": the " + crash_line(read_json(crash)) + ". The traceback is in "
               + display(LOG_DIR) + "; tell the user if this session cannot fix it.")
@@ -1297,6 +1514,9 @@ def cmd_kick(args, config: dict) -> None:
     if sys.platform == "win32":
         flags = getattr(subprocess, "CREATE_NO_WINDOW", 0)
         end = subprocess.run(["schtasks", "/End", "/TN", TASK_NAME], capture_output=True, text=True, creationflags=flags)
+        # /End ends the watcher but not the dispatcher it started (Mistral, Moosfels, Stahlwerk, 2026-10-30): a healthy
+        # one runs on and the new watcher's waits behind it; a hung one is ended by the next dispatcher's lock after
+        # three minutes without a heartbeat. A kill here could hit another process that reused the pid.
         time.sleep(3)
         run = subprocess.run(["schtasks", "/Run", "/TN", TASK_NAME], capture_output=True, text=True, creationflags=flags)
         result = "end " + str(end.returncode) + ", run " + str(run.returncode) + " " + " ".join((run.stdout + run.stderr).split())
@@ -1304,7 +1524,7 @@ def cmd_kick(args, config: dict) -> None:
         run = subprocess.run(["launchctl", "kickstart", "-k", "gui/" + str(os.getuid()) + "/" + LAUNCHD_LABEL],
                              capture_output=True, text=True)
         result = "kickstart " + str(run.returncode) + " " + " ".join((run.stdout + run.stderr).split())
-    log(this_machine(config), "kick: the dispatcher was not reporting, restarted the watcher (" + result + ")")
+    log(this_machine(config), "kick: restarted the watcher (" + result + ")")
     print(result)
 
 
@@ -1363,13 +1583,13 @@ def main() -> None:
     p.add_argument("folders", nargs="+")
     p = sub.add_parser("whoami")
     p.add_argument("--desk", action="store_true", help="print only Machine:Desk, for scripts")
-    for name in ["hook", "wait", "watch", "dispatch", "kick", "install-hook", "uninstall-hook"]:
+    for name in ["hook", "wait", "watch", "dispatch", "deliver-one", "kick", "install-hook", "uninstall-hook"]:
         sub.add_parser(name)
     args = parser.parse_args()
     config = load_config()
     commands = {"send": cmd_send, "sessions": cmd_sessions, "status": cmd_status, "inbox": cmd_inbox,
                 "desk-of": cmd_desk_of, "whoami": cmd_whoami, "hook": cmd_hook, "dispatch": cmd_dispatch,
-                "watch": cmd_watch, "kick": cmd_kick,
+                "watch": cmd_watch, "kick": cmd_kick, "deliver-one": cmd_deliver_one,
                 # The Stop hook of versions 2 and 3, still registered until install-hook runs again on a machine.
                 "wait": lambda a, c: None,
                 "install-hook": lambda a, c: edit_settings(True), "uninstall-hook": lambda a, c: edit_settings(False)}

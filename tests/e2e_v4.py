@@ -297,12 +297,20 @@ try:
     (HOME / "cli_fail").unlink()
     expect("T9 retried and delivered after retry_minutes", wait_for(lambda: (m9.parent / "read" / m9.name).is_file(), 40))
     expect("T9 notified once only", (HOME / "notified.txt").read_text().count("T9 no login") == 1)
+    expect("TB2 the sender gets a notice that its mail waits for the user", wait_for(lambda: any("ClaudeMail notice: T9 no login" in t
+           and "waits for the user" in t and "D-261012-2" in t for t in received(S0)), 30), received(S0)[-1:])
 
     # the app does not open the session in time: waits for the user, retried later
     (HOME / "open_ignore").touch()
     m10 = sent_path(run(["send", "--to", "Pulvermaar:Foo", "--for-session", E[:8], "--subject", "T10 slow", "--body-file", body("x")], session=S0).stdout)
     st10 = lambda: json.loads(m10.with_name(m10.name[:-3] + ".delivery.json").read_text()) if m10.with_name(m10.name[:-3] + ".delivery.json").exists() else {}
+    applog = HOME / "Library/Logs/Claude/main.log"
+    applog.parent.mkdir(parents=True, exist_ok=True)
+    applog.write_text("2026-10-30 00:41:59 [info] [CCD] Warming session local_" + E + "\n"
+                      "2026-10-30 00:41:59 [info] [CliGovernor] at cap; yielding warm spawn\n")
     expect("T10 opening times out to the user", wait_for(lambda: st10().get("state") == "waiting for the user", 30), st10())
+    expect("TB4 the reason says the app did not start it, with what its log says", "the app did not start the session" in st10()["reason"]
+           and "yielding warm spawn" in st10()["reason"] and "of its sessions have a process" in st10()["reason"], st10())
     (HOME / "open_ignore").unlink()
     expect("T10 retried and delivered", wait_for(delivered_to(m10, E), 40))
 
@@ -490,27 +498,71 @@ try:
     (SVC / "mail/Pulvermaar/desks/Foo/noheader.md").write_text("just text")
     expect("malformed files go to rejected/ and the dispatcher lives on", wait_for(lambda: (SVC / "mail/Pulvermaar/desks/Foo/rejected/garbage.md").is_file()
            and (SVC / "mail/Pulvermaar/desks/Foo/rejected/noheader.md").is_file()) and dispatcher.poll() is None)
+    sent_now = time.strftime("%Y-%m-%dT%H:%M:%S") + time.strftime("%z")[:3] + ":" + time.strftime("%z")[3:]
+    (SVC / "mail/Pulvermaar/desks/Foo/261030-000001-Pulvermaar.md").write_text("---\nfrom: Pulvermaar:Bar\nfrom_session: " + S0
+        + "\nto: Pulvermaar:Foo\nsubject: \nsent: " + sent_now + "\nid: 261030-000001-Pulvermaar\n---\n\nno subject\n")
+    expect("TB3 a rejected message with a sender sends that session a notice", wait_for(lambda: any("was rejected" in t and "lacks subject" in t
+           for t in received(S0)), 30), received(S0)[-1:])
+    calls = len(opened_sessions())
+    (SVC / "mail/Pulvermaar/desks/Foo/261030-000002-Pulvermaar.md").write_text("---\nfrom: Pulvermaar:Bar\nfrom_session: " + S0
+        + "\nto: Pulvermaar:Foo\nfor_session: local_zz\nsubject: TB5 other account\nsent: " + sent_now
+        + "\nid: 261030-000002-Pulvermaar\n---\n\nfor the old account's session\n")
+    expect("TB5 mail for a session under another account goes to a new session that is told so", wait_for(lambda: len(opened_sessions()) > calls, 20)
+           and wait_for(lambda: any("another account on this machine (other-account)" in t for t in received(opened_sessions()[-1])), 20))
+    calls = len(opened_sessions())
+    stray = SVC / "mail/Pulvermaar/desks/Bar/261030-000004-Mistral.md"
+    stray.write_text("---\nfrom: Mistral:dispatcher\nto: Pulvermaar:Bar\nfor_session: " + sid("y") + "\nsubject: ClaudeMail notice: x\nsent: "
+                     + sent_now + "\nid: 261030-000004-Mistral\n---\n\nnotice for a session that is not here\n")
+    expect("TB7 a notice for a session that is not on this machine is set aside, and opens no session",
+           wait_for(lambda: (stray.parent / "read" / stray.name).is_file(), 20) and len(opened_sessions()) == calls
+           and json.loads((stray.parent / "read" / (stray.name[:-3] + ".delivery.json")).read_text())["state"] == "set aside")
 
-    # a change to signed_mail.py restarts the dispatcher too
-    with open(SVC / "signed_mail.py", "a") as fh:
-        fh.write("\n")
-    expect("TA7 a changed signed_mail.py ends the dispatcher for a restart", wait_for(lambda: dispatcher.poll() == 3, 15), dispatcher.poll())
-
-    # a crash loop is visible: a running session with two peer keys trips the assertion in inbox_payload
-    pid_a = next(json.loads(p.read_text())["pid"] for p in (HOME / ".claude/sessions").glob("*.json") if A in p.read_text())
-    extra = HOME / ".claude/sessions" / (str(pid_a) + ".def456.key")
-    extra.write_text(json.dumps({"peerToken": "other"}))
-    mc = sent_path(run(["send", "--to", "Pulvermaar:Foo", "--for-session", A[:8], "--subject", "TA8 crash", "--body-file", body("x")], session=S0).stdout)
-    crash_file = HOME / ".claude/claudemail/crash.json"
     def dispatch_once():
         d = subprocess.Popen([PY, "-B", str(SVC / "mail.py"), "dispatch"], env=ENV, stdout=subprocess.DEVNULL,
                              stderr=open(BASE / "dispatch.err", "w"))
         procs.append(d)
         return d
-    expect("TA8 the dispatcher ends on the assertion", dispatch_once().wait(20) == 1)
+    status_of = lambda m: json.loads(m.with_name(m.name[:-3] + ".delivery.json").read_text()) if m.with_name(m.name[:-3] + ".delivery.json").exists() else {}
+    notices = lambda words: [t for t in received(S0) if "ClaudeMail notice" in t and words in t]
+
+    # one failing message fails alone (design R4e): a running session with two peer keys trips the assertion in inbox_payload
+    pid_a = next(json.loads(p.read_text())["pid"] for p in (HOME / ".claude/sessions").glob("*.json") if A in p.read_text())
+    extra = HOME / ".claude/sessions" / (str(pid_a) + ".def456.key")
+    extra.write_text(json.dumps({"peerToken": "other"}))
+    mb1 = sent_path(run(["send", "--to", "Pulvermaar:Foo", "--for-session", A[:8], "--subject", "TB1 fails", "--body-file", body("x")], session=S0).stdout)
+    expect("TB1 the message is marked failed with the kind and place", wait_for(lambda: status_of(mb1).get("state") == "failed", 20)
+           and status_of(mb1)["signature"].startswith("AssertionError at mail.py:") and "inbox_payload" in status_of(mb1)["signature"], status_of(mb1))
+    calls = len(opened_sessions())
+    mb2 = sent_path(run(["send", "--to", "Pulvermaar:Home", "--new", "--name", "TB1 after", "--subject", "TB1 later desk", "--body-file", body("x")], session=S0).stdout)
+    expect("TB1 the dispatcher lives on and delivers a desk after it", wait_for(lambda: len(opened_sessions()) > calls, 20)
+           and wait_for(delivered_to(mb2, opened_sessions()[-1]), 20) and dispatcher.poll() is None, (BASE / "dispatch.err").read_text())
+    expect("TB1 the report counts it as failed", wait_for(lambda: latest()["undelivered"]["failed"] == 1, 10), latest()["undelivered"])
+    expect("TB1 the user is notified once", (HOME / "notified.txt").read_text().count("Claude mail failed") == 1)
+    expect("TB1 the sender gets a notice", wait_for(lambda: notices("TB1 fails") and notices("itself failed"), 30), received(S0)[-1:])
+    first_failed = status_of(mb1)["failed"]
+    time.sleep(2)
+    expect("TB1 it is not tried again on the same code", status_of(mb1)["failed"] == first_failed and not (mb1.parent / "read" / mb1.name).exists())
+    extra.unlink()
+
+    # a change to signed_mail.py restarts the dispatcher too, and a failed message is tried once more on the new code
+    with open(SVC / "signed_mail.py", "a") as fh:
+        fh.write("\n")
+    expect("TA7 a changed signed_mail.py ends the dispatcher for a restart", wait_for(lambda: dispatcher.poll() == 3, 15), dispatcher.poll())
+    dispatcher = dispatch_once()
+    expect("TB1 on the new code the failed message is tried again and delivered", wait_for(delivered_to(mb1, A), 20), status_of(mb1))
+
+    # a crash loop outside delivery is visible: a delivery record without `arrived` ends the count of undelivered mail
+    stamp_now = time.strftime("%Y-%m-%dT%H:%M:%S") + time.strftime("%z")[:3] + ":" + time.strftime("%z")[3:]
+    bad = SVC / "mail/Pulvermaar/desks/Foo/261030-000003-Pulvermaar.md"
+    bad.write_text("---\nfrom: Pulvermaar:Bar\nfrom_session: " + S0 + "\nto: Pulvermaar:Foo\nfor_session: " + sid("x")
+                   + "\nsubject: TA8 bad record\nsent: " + stamp_now + "\nid: 261030-000003-Pulvermaar\n---\n\nx\n")
+    bad_status = bad.with_name(bad.name[:-3] + ".delivery.json")
+    bad_status.write_text(json.dumps({"state": "waiting for the user", "tried": stamp_now, "notified": stamp_now, "reason": "x"}))
+    crash_file = HOME / ".claude/claudemail/crash.json"
+    expect("TA8 the dispatcher ends on the bad record", dispatcher.wait(20) == 1)
     crash = json.loads(crash_file.read_text())
-    expect("TA8 crash.json names the kind and place", crash["restarts"] == 1 and crash["signature"].startswith("AssertionError at mail.py:")
-           and "inbox_payload" in crash["signature"], crash)
+    expect("TA8 crash.json names the kind and place", crash["restarts"] == 1 and crash["signature"].startswith("KeyError at mail.py:")
+           and "undelivered" in crash["signature"], crash)
     crashed = latest()
     expect("TA8 a report says it is crashing, with the sessions it had", crashed["crash"]["signature"] == crash["signature"]
            and any(s["session"] == "local_" + A for s in crashed["sessions"]), crashed)
@@ -518,12 +570,12 @@ try:
     expect("TA8 a second crash counts on", dispatch_once().wait(20) == 1 and json.loads(crash_file.read_text())["restarts"] == 2)
     expect("TA8 and writes no new report for the same crash", newest() == first_name, newest())
     out = run(["sessions", "Pulvermaar"]).stdout
-    expect("TA8 sessions shows the crash", "! dispatcher crashing since" in out and "AssertionError" in out, out)
+    expect("TA8 sessions shows the crash", "! dispatcher crashing since" in out and "KeyError" in out, out)
     p = run(["send", "--to", "Pulvermaar:Foo", "--for-session", A[:8], "--subject", "TA8 while crashing", "--body-file", body("x")], session=S0)
     expect("TA8 send says it is crashing instead of 'within seconds'", "crashing since" in p.stdout and "within seconds" not in p.stdout, p.stdout)
     (HOME / ".claude/claudemail/kick.json").unlink()
     p = run(["hook"], stdin=json.dumps({"session_id": S0, "cwd": str(BAR), "transcript_path": ""}))
-    expect("TA8 the hook tells the session instead of kicking", "crashing since" in p.stdout and "kick" not in
+    expect("TA8 the hook tells the session instead of kicking", "crashing since" in p.stdout and "restarting its watcher" not in
            (HOME / ".claude/claudemail/logs" / ("claudemail.pulvermaar." + time.strftime("%y%m%d") + ".log")).read_text(), p.stdout)
     old = json.loads(crash_file.read_text())
     crash_file.write_text(json.dumps(dict(old, last="2026-10-01T00:00:00-05:00")))
@@ -531,13 +583,16 @@ try:
     beat_file.write_text(json.dumps(dict(json.loads(beat_file.read_text()), updated="2026-10-01T00:00:00-05:00")))
     (HOME / ".claude/claudemail/kick.json").unlink()
     p = run(["hook"], stdin=json.dumps({"session_id": S0, "cwd": str(BAR), "transcript_path": ""}))
+    log_text = lambda: (HOME / ".claude/claudemail/logs" / ("claudemail.pulvermaar." + time.strftime("%y%m%d") + ".log")).read_text()
     expect("TA8b a stale crash.json with no dispatcher running is no crash loop: the hook kicks", "crashing" not in p.stdout
            and wait_for(lambda: (HOME / "launchctl.txt").exists() and "kickstart" in (HOME / "launchctl.txt").read_text(), 10), p.stdout)
+    expect("TB6 the kick says why, in the right words", "has not reported for" in log_text() and "restarting its watcher" in log_text()
+           and wait_for(lambda: "kick: restarted the watcher" in log_text(), 10) and "was not reporting" not in log_text())
     crash_file.write_text(json.dumps(old))
-    extra.unlink()
+    bad_status.unlink()
+    bad.unlink()
     dispatcher = dispatch_once()
-    expect("TA8 recovered: the message that tripped it is delivered", wait_for(delivered_to(mc, A), 20))
-    expect("TA8 crash.json gone and the report no longer says crashing", wait_for(lambda: not crash_file.exists() and "crash" not in latest(), 10),
+    expect("TA8 crash.json gone and the report no longer says crashing", wait_for(lambda: not crash_file.exists() and "crash" not in latest(), 15),
            latest())
     dispatcher.kill()
     dispatcher.wait()
