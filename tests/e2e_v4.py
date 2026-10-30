@@ -29,6 +29,8 @@ OTHER.mkdir(parents=True)
 # of a kick just made keeps the sandbox from doing that (it did once, on 2026-10-26).
 (HOME / ".claude" / "claudemail" / "kick.json").write_text(json.dumps({"at": time.strftime("%Y-%m-%dT%H:%M:%S")
                                                                        + time.strftime("%z")[:3] + ":" + time.strftime("%z")[3:]}))
+(HOME / ".claude" / "claudemail" / "logs").mkdir()
+(HOME / ".claude" / "claudemail" / "logs" / "claudemail.pulvermaar.250101.log").write_text("old\n")    # pruned at start (TA2)
 shutil.copy(LIVE / "mail.py", SVC / "mail.py")
 shutil.copy(LIVE / "signed_mail.py", SVC / "signed_mail.py")
 cfg = json.loads((LIVE / "config" / "defaults.json").read_text())
@@ -112,7 +114,8 @@ with open(home / "cli_calls.jsonl", "a") as fh:
     fh.write(json.dumps({"session": args[args.index("--session-id") + 1], "cwd": os.getcwd(), "args": args}) + "\\n")
 ''')
 (BIN / "osascript").write_text("#!/bin/sh\necho \"$@\" >> " + str(HOME / "notified.txt") + "\n")
-for f in [BIN / "open", BIN / "osascript", CLI]:
+(BIN / "launchctl").write_text("#!/bin/sh\necho \"$@\" >> " + str(HOME / "launchctl.txt") + "\n")   # never the real LaunchAgent
+for f in [BIN / "open", BIN / "osascript", BIN / "launchctl", CLI]:
     f.chmod(0o755)
 
 ENV = {k: v for k, v in os.environ.items() if not k.startswith("CLAUDE")}
@@ -331,6 +334,23 @@ try:
     expect("report lists sessions and desks", any(s["session"] == "local_" + A and s["state"] == "idle" for s in rep["sessions"])
            and "Foo" in rep["desks"] and "Home" in rep["desks"] and "count" in rep["undelivered"], rep)
     expect("at most five reports kept", len(reports) <= 5)
+    expect("TA1 the report states its protocol and the peers it sees", rep["protocol"] == 4 and isinstance(rep["seen"], dict)
+           and rep["undelivered"]["unseen"] == 0, rep)
+    expect("TA2 a log older than log_keep_days was pruned at start", not (HOME / ".claude/claudemail/logs/claudemail.pulvermaar.250101.log").exists())
+    newest = lambda: max(p.name for p in (SVC / "mail/Pulvermaar/reports").glob("*.json"))
+    before = newest()
+    time.sleep(3)
+    expect("TA3 nothing changed, so no new report within report_minutes", newest() == before, before)
+    store("m", BAR, "Report trigger")
+    expect("TA3 a new session in the store writes a report at once", wait_for(lambda: newest() != before, 10), before)
+    time.sleep(2)
+    before = newest()
+    for letter, bump in (("e", 5000), ("f", 9000), ("e", 12000)):        # two sessions trade places by activity
+        rec = json.loads((STORE / ("local_" + sid(letter) + ".json")).read_text())
+        rec["lastActivityAt"] = int(time.time() * 1000) + bump
+        (STORE / ("local_" + sid(letter) + ".json")).write_text(json.dumps(rec))
+        time.sleep(1.2)
+    expect("TA3b sessions trading places by activity write no report", newest() == before, newest())
 
     # another machine, from its report
     D = sid("d")
@@ -356,6 +376,9 @@ try:
     expect("T14d a machine still on a v3 report lists its desk folders", p.returncode == 0 and "Teppich:Computers" in p.stdout, p.stdout + p.stderr)
     p = run(["send", "--to", "Teppich:Computers", "--for-session", sid("8"), "--subject", "T14d", "--body-file", body("x")], session=S0, check=False)
     expect("T14d mail with a full id to such a machine is accepted", p.returncode == 0 and "desks/Computers/" in p.stdout, p.stdout + p.stderr)
+    expect("TA4 send says that machine's dispatcher is silent instead of 'within seconds'",
+           "silent since" in p.stdout and "within seconds" not in p.stdout, p.stdout)
+    expect("TA4 sessions shows the same warning", "! Teppich's dispatcher is silent since" in run(["sessions", "Teppich"]).stdout)
     p = run(["send", "--reply-to", str(m8.parent / "read" / m8.name), "--body-file", body("x")], session=A, check=False)
     expect("T15 reply to a program refused", p.returncode != 0 and "is a program" in p.stderr, p.stderr)
     p = run(["send", "--to", "all", "--subject", "x", "--body-file", body("x")], session=S0, check=False)
@@ -418,12 +441,119 @@ try:
            and len(s["hooks"]["UserPromptSubmit"]) == 1 and "SessionStart" in s["hooks"] and s["model"] == "x", s)
     expect("old Stop hook command is a no-op", run(["wait"], stdin="{}").returncode == 0)
 
+    # a settings file the app cannot parse (a UTF-8 BOM, Altiplano 2026-10-27 to 10-30)
+    settings = HOME / ".claude/settings.json"
+    plain = settings.read_bytes()
+    settings.write_bytes(b"\xef\xbb\xbf" + plain)
+    latest = lambda: json.loads(max((SVC / "mail/Pulvermaar/reports").glob("*.json")).read_text())
+    expect("TA5 an unparsable settings file is in the report", wait_for(lambda: "BOM" in latest()["settings_problem"], 10), latest())
+    expect("TA5 and notified once", wait_for(lambda: (HOME / "notified.txt").read_text().count("settings unreadable") == 1, 10))
+    settings.write_bytes(plain)
+    expect("TA5 cleared once it parses again", wait_for(lambda: latest()["settings_problem"] == "", 10), latest())
+
+    # a peer that does not see this machine's reports: one-way sync (Sandbank, 2026-10-29)
+    stamp = time.strftime("%y%m%d-%H%M%S", time.gmtime())
+    (SVC / "mail/Mistral/reports" / (stamp + "-000Z.json")).write_text(json.dumps({
+        "machine": "Mistral", "updated": time.strftime("%Y-%m-%dT%H:%M:%S") + time.strftime("%z")[:3] + ":" + time.strftime("%z")[3:],
+        "sessions": [], "desks": {"Home": "C:/Users/goocy"}, "undelivered": {"count": 0}, "protocol": 4,
+        "seen": {"Pulvermaar": "261001-000000-000Z"}}))
+    expect("TA6 sessions warns that Mistral has not seen this machine's reports",
+           "has not seen this machine's reports since 261001" in run(["sessions", "Mistral"]).stdout)
+    ahead = time.time() + 3 * 3600
+    (SVC / "mail/Stahlwerk/reports").mkdir(parents=True, exist_ok=True)
+    (SVC / "mail/Stahlwerk/reports" / (time.strftime("%y%m%d-%H%M%S", time.gmtime(ahead)) + "-000Z.json")).write_text(json.dumps({
+        "machine": "Stahlwerk", "updated": time.strftime("%Y-%m-%dT%H:%M:%S", time.localtime(ahead)) + time.strftime("%z")[:3] + ":" + time.strftime("%z")[3:],
+        "sessions": [], "desks": {"Home": "C:/Users/goocy"}, "undelivered": {"count": 0}}))
+    expect("TA6b a peer whose clock runs ahead is named as such", "clock runs 1" in run(["sessions", "Stahlwerk"]).stdout,
+           run(["sessions", "Stahlwerk"]).stdout)
+    future = SVC / "mail/Pulvermaar/reports" / (time.strftime("%y%m%d-%H%M%S", time.gmtime(ahead)) + "-000Z.json")
+    future.write_text(json.dumps({"machine": "Pulvermaar", "updated": "x"}))
+    store("p", BAR, "Report trigger 2")
+    expect("TA6c a report named in the future is pruned, the new one kept", wait_for(lambda: not future.exists(), 10)
+           and latest()["machine"] == "Pulvermaar" and "seen" in latest(), latest())
+
+    # a desk of the synced tree starts its sessions in its folder, not in the folder of its newest session, which may
+    # be gone (Moosfels' ClaudeMail desk pointed at the removed Steward folder, 2026-10-30)
+    store("q", BAR / "gone", "Newest Bar session, folder removed")
+    rec = json.loads((STORE / ("local_" + sid("q") + ".json")).read_text())
+    rec["lastActivityAt"] = int(time.time() * 1000) + 60000
+    (STORE / ("local_" + sid("q") + ".json")).write_text(json.dumps(rec))
+    calls_before = len(opened_sessions())
+    mq = sent_path(run(["send", "--to", "Pulvermaar:Bar", "--new", "--name", "TA10 tree folder", "--subject", "TA10", "--body-file", body("x")], session=S0).stdout)
+    expect("TA10 a new session for a synced desk starts in its folder", wait_for(lambda: len(opened_sessions()) > calls_before)
+           and json.loads((HOME / "cli_calls.jsonl").read_text().splitlines()[-1])["cwd"] in (str(BAR), str(BAR.resolve())),
+           (HOME / "cli_calls.jsonl").read_text().splitlines()[-1])
+
     expect("dispatcher still running", dispatcher.poll() is None, (BASE / "dispatch.err").read_text())
     expect("no session refused a post for a bad auth line", not list((HOME / "received").glob("*.refused")))
     (SVC / "mail/Pulvermaar/desks/Foo/garbage.md").write_bytes(b"\xff\xfe no header")
     (SVC / "mail/Pulvermaar/desks/Foo/noheader.md").write_text("just text")
     expect("malformed files go to rejected/ and the dispatcher lives on", wait_for(lambda: (SVC / "mail/Pulvermaar/desks/Foo/rejected/garbage.md").is_file()
            and (SVC / "mail/Pulvermaar/desks/Foo/rejected/noheader.md").is_file()) and dispatcher.poll() is None)
+
+    # a change to signed_mail.py restarts the dispatcher too
+    with open(SVC / "signed_mail.py", "a") as fh:
+        fh.write("\n")
+    expect("TA7 a changed signed_mail.py ends the dispatcher for a restart", wait_for(lambda: dispatcher.poll() == 3, 15), dispatcher.poll())
+
+    # a crash loop is visible: a running session with two peer keys trips the assertion in inbox_payload
+    pid_a = next(json.loads(p.read_text())["pid"] for p in (HOME / ".claude/sessions").glob("*.json") if A in p.read_text())
+    extra = HOME / ".claude/sessions" / (str(pid_a) + ".def456.key")
+    extra.write_text(json.dumps({"peerToken": "other"}))
+    mc = sent_path(run(["send", "--to", "Pulvermaar:Foo", "--for-session", A[:8], "--subject", "TA8 crash", "--body-file", body("x")], session=S0).stdout)
+    crash_file = HOME / ".claude/claudemail/crash.json"
+    def dispatch_once():
+        d = subprocess.Popen([PY, "-B", str(SVC / "mail.py"), "dispatch"], env=ENV, stdout=subprocess.DEVNULL,
+                             stderr=open(BASE / "dispatch.err", "w"))
+        procs.append(d)
+        return d
+    expect("TA8 the dispatcher ends on the assertion", dispatch_once().wait(20) == 1)
+    crash = json.loads(crash_file.read_text())
+    expect("TA8 crash.json names the kind and place", crash["restarts"] == 1 and crash["signature"].startswith("AssertionError at mail.py:")
+           and "inbox_payload" in crash["signature"], crash)
+    crashed = latest()
+    expect("TA8 a report says it is crashing, with the sessions it had", crashed["crash"]["signature"] == crash["signature"]
+           and any(s["session"] == "local_" + A for s in crashed["sessions"]), crashed)
+    first_name = newest()
+    expect("TA8 a second crash counts on", dispatch_once().wait(20) == 1 and json.loads(crash_file.read_text())["restarts"] == 2)
+    expect("TA8 and writes no new report for the same crash", newest() == first_name, newest())
+    out = run(["sessions", "Pulvermaar"]).stdout
+    expect("TA8 sessions shows the crash", "! dispatcher crashing since" in out and "AssertionError" in out, out)
+    p = run(["send", "--to", "Pulvermaar:Foo", "--for-session", A[:8], "--subject", "TA8 while crashing", "--body-file", body("x")], session=S0)
+    expect("TA8 send says it is crashing instead of 'within seconds'", "crashing since" in p.stdout and "within seconds" not in p.stdout, p.stdout)
+    (HOME / ".claude/claudemail/kick.json").unlink()
+    p = run(["hook"], stdin=json.dumps({"session_id": S0, "cwd": str(BAR), "transcript_path": ""}))
+    expect("TA8 the hook tells the session instead of kicking", "crashing since" in p.stdout and "kick" not in
+           (HOME / ".claude/claudemail/logs" / ("claudemail.pulvermaar." + time.strftime("%y%m%d") + ".log")).read_text(), p.stdout)
+    old = json.loads(crash_file.read_text())
+    crash_file.write_text(json.dumps(dict(old, last="2026-10-01T00:00:00-05:00")))
+    beat_file = HOME / ".claude/claudemail/dispatcher.json"
+    beat_file.write_text(json.dumps(dict(json.loads(beat_file.read_text()), updated="2026-10-01T00:00:00-05:00")))
+    (HOME / ".claude/claudemail/kick.json").unlink()
+    p = run(["hook"], stdin=json.dumps({"session_id": S0, "cwd": str(BAR), "transcript_path": ""}))
+    expect("TA8b a stale crash.json with no dispatcher running is no crash loop: the hook kicks", "crashing" not in p.stdout
+           and wait_for(lambda: (HOME / "launchctl.txt").exists() and "kickstart" in (HOME / "launchctl.txt").read_text(), 10), p.stdout)
+    crash_file.write_text(json.dumps(old))
+    extra.unlink()
+    dispatcher = dispatch_once()
+    expect("TA8 recovered: the message that tripped it is delivered", wait_for(delivered_to(mc, A), 20))
+    expect("TA8 crash.json gone and the report no longer says crashing", wait_for(lambda: not crash_file.exists() and "crash" not in latest(), 10),
+           latest())
+    dispatcher.kill()
+    dispatcher.wait()
+
+    # the watcher ends on a code change, for launchd to start it again on the new code
+    watcher = subprocess.Popen([PY, "-B", str(SVC / "mail.py"), "watch"], env=ENV, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+    procs.append(watcher)
+    time.sleep(4)
+    with open(SVC / "mail.py", "a") as fh:
+        fh.write("\n# changed\n")
+    code = None
+    try:
+        code = watcher.wait(30)
+    except subprocess.TimeoutExpired:
+        pass
+    expect("TA9 the watcher exits 0 after the code changed", code == 0, code)
     log = "".join(p.read_text() for p in (HOME / ".claude/claudemail/logs").glob("*.log"))
     print("--- log tail\n" + "\n".join(log.splitlines()[-12:]))
 finally:

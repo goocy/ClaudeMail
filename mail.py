@@ -46,6 +46,7 @@ import socket
 import subprocess
 import sys
 import time
+import traceback
 import uuid
 from pathlib import Path
 
@@ -79,6 +80,8 @@ EXIT_CODE_CHANGED = 3
 EXIT_ALREADY_RUNNING = 4
 INVALID_NAME_CHARS = '<>:"/|?*' + chr(92)
 WAITING_FOR_USER = "waiting for the user"
+PROTOCOL = 4                                                        # published in each report (design R6a, phase 1)
+CRASH_FILE = "crash.json"                                           # machine-local, while the dispatcher crash-loops
 
 
 # ---------------------------------------------------------------- config and machine
@@ -612,29 +615,76 @@ def write_report(machine: str, report: dict) -> None:
     """A new file per report, then all but the newest five go: a rewritten file kept causing Resilio conflicts, and
     with only two kept a reader on Mistral briefly found none (Resilio delivered the deletions first, 2026-09-28)."""
     stamp = datetime.datetime.now(datetime.timezone.utc)
-    write_json(machine_dir(machine) / REPORTS / (stamp.strftime("%y%m%d-%H%M%S-") + "%03dZ.json" % (stamp.microsecond // 1000)),
-               report)
-    for old in report_names(machine)[5:]:
-        old.unlink()
+    path = machine_dir(machine) / REPORTS / (stamp.strftime("%y%m%d-%H%M%S-") + "%03dZ.json" % (stamp.microsecond // 1000))
+    write_json(path, report)
+    # A name from a clock that ran ahead (Teppich, 2026-10-30: three hours) would sort above every new report for as long
+    # and be read instead; once this clock is right, such names go, and the report just written is always kept.
+    kept = [p for p in report_names(machine) if p != path and report_age(p.stem) > -120][:4]
+    for old in report_names(machine):
+        if old != path and old not in kept:
+            old.unlink()
 
 
 def machine_view(machine: str, config: dict) -> dict:
-    """{sessions, desks, as_of}: computed here for this machine, from the newest report for another one, as old as that
-    report plus Resilio's delay. A machine that is asleep or off still gets mail, delivered when it is back, so an old
-    report is used and only flagged. A machine whose dispatcher has not written a v4 report yet (none, or one from v3
-    without sessions: Altiplano and Sandbank on 2026-10-26) lists no sessions, and its desks are its desk folders here;
-    mail to it waits until its dispatcher runs v4."""
+    """{sessions, desks, as_of, warning}: computed here for this machine, from the newest report for another one, as
+    old as that report plus Resilio's delay. A machine that is asleep or off still gets mail, delivered when it is back,
+    so an old report is used and only flagged (dispatcher_warning). A machine whose dispatcher has not written a v4
+    report yet (none, or one from v3 without sessions: Altiplano and Sandbank on 2026-10-26) lists no sessions, and its
+    desks are its desk folders here; mail to it waits until its dispatcher runs v4."""
+    warning = dispatcher_warning(machine, config)
     if machine == this_machine(config):
         sessions, desks = session_listing(config)
-        return {"sessions": sessions, "desks": desks, "as_of": ""}
+        return {"sessions": sessions, "desks": desks, "as_of": "", "warning": warning}
     report = read_report(machine)
     if "sessions" not in report:
         desks = {f.name: "(not reported yet)" for f in desk_folders(machine)}
-        return {"sessions": [], "desks": dict(desks, **{HOME_DESK: "its home folder"}),
+        return {"sessions": [], "desks": dict(desks, **{HOME_DESK: "its home folder"}), "warning": warning,
                 "as_of": "never by version 4 (" + machine + "'s dispatcher has not reported since it changed)"}
-    stale = age(report["updated"]) > 60 * float(config["stale_minutes"])
-    return {"sessions": report["sessions"], "desks": report["desks"],
-            "as_of": short_time(report["updated"]) + (", its dispatcher is silent since then" if stale else "")}
+    return {"sessions": report["sessions"], "desks": report["desks"], "as_of": short_time(report["updated"]),
+            "warning": warning}
+
+
+def crash_line(crash: dict) -> str:
+    return ("dispatcher crashing since " + short_time(crash["since"]) + " (" + str(crash["restarts"]) + " restarts): "
+            + crash["signature"] + "; its mail waits until that is fixed")
+
+
+def report_age(name: str) -> float:
+    """Seconds since a report was written, from its name (a UTC stamp ending in Z); a local-time name is from before
+    2026-10-27 and counts as older than anything."""
+    if not name.endswith("Z"):
+        return float("inf")
+    stamp = datetime.datetime.strptime(name[:13], "%y%m%d-%H%M%S").replace(tzinfo=datetime.timezone.utc)
+    return (datetime.datetime.now(datetime.timezone.utc) - stamp).total_seconds()
+
+
+def dispatcher_warning(machine: str, config: dict) -> str:
+    """What a sender should know before trusting 'within seconds': that machine's dispatcher crashes, is silent, or
+    does not see this machine's reports (a one-way sync, Sandbank 2026-10-29). Empty when none of these holds."""
+    here = this_machine(config)
+    if machine == here:
+        crash = LOCAL_DIR / CRASH_FILE
+        return crash_line(read_json(crash)) if crash.is_file() and age(read_json(crash)["last"]) < 180 else ""
+    report = read_report(machine)
+    if "updated" not in report:
+        return machine + "'s dispatcher has never reported; mail waits until it runs"
+    limit = 60 * float(config["stale_minutes"])
+    if age(report["updated"]) < -120:
+        return (machine + "'s clock runs " + str(int(-age(report["updated"]) // 60)) + " minutes ahead of this one's;"
+                " its reports cannot be dated, so whether it runs is unknown")
+    stale = age(report["updated"]) > limit
+    if "crash" in report:
+        return machine + "'s " + crash_line(report["crash"]) + (" (its last report, " + short_time(report["updated"]) + ")" if stale else "")
+    if stale:
+        return machine + "'s dispatcher is silent since " + short_time(report["updated"]) + "; mail waits until it is back"
+    if "seen" in report:
+        # How old this machine's newest report was, as that machine saw it when it wrote its own: not what Resilio's
+        # delay to here adds. "" (never seen) counts as older than anything.
+        theirs = report["seen"][here] if here in report["seen"] else ""
+        if report_age(theirs) - report_age(report_names(machine)[0].stem) > limit:
+            return (machine + " has not seen this machine's reports since " + (theirs or "ever")
+                    + ": the sync between the two is one-way, and replies may not arrive")
+    return ""
 
 
 def find_desk_name(name: str, desks: dict):
@@ -646,6 +696,8 @@ def find_desk_name(name: str, desks: dict):
 
 def print_sessions(machine: str, view: dict, desk=None) -> None:
     print(machine + (" (as of " + view["as_of"] + ")" if view["as_of"] else "") + ":")
+    if view["warning"]:
+        print("  ! " + view["warning"])
     for desk_name in sorted(view["desks"], key=str.casefold):
         if desk is not None and desk_name != desk:
             continue
@@ -725,8 +777,8 @@ def cmd_send(args, config: dict) -> None:
         write_atomically(path, format_message(fields, body))
         print("sent " + display(path))
         print("  to " + (("session " + session) if session else "a new session" + (" '" + name + "'" if name else ""))
-              + " on " + machine + ":" + desk
-              + "; " + machine + "'s dispatcher delivers it within seconds of the file arriving there")
+              + " on " + machine + ":" + desk + "; "
+              + (dispatcher_warning(machine, config) or machine + "'s dispatcher delivers it within seconds of the file arriving there"))
 
 
 def resolve_recipients(args, config: dict, sender: str, sender_session: str) -> list:
@@ -833,15 +885,37 @@ def delivery_text(machine: str, desk: str, path: Path, text: str, config: dict, 
     return "\n\n".join(parts + [block])
 
 
-def desk_folder(desk: str, desktop: dict) -> str:
-    """The folder a new session for this desk starts in: the newest desktop session's folder on that desk, any age,
-    archived included; the home folder for Home; '' when no desktop session ever ran there (mail sent as a reply to a
-    session that ran outside the app)."""
+def tree_folders(desk: str) -> list:
+    """The folders in the synced tree that are this desk: below Services, Projects or Tools the folder whose name
+    without its date stamp is the desk, elsewhere in ~/ResilioSync the top folder of that name; each confirmed by
+    desk_for, so a '.desk' file that names another desk excludes it."""
+    wanted = desk.casefold()
+    candidates = [SYNC_ROOT / group / name for group in GROUP_FOLDERS if (SYNC_ROOT / group).is_dir()
+                  for name in os.listdir(SYNC_ROOT / group) if drop_date_stamp(name).casefold() == wanted]
+    if desk not in GROUP_FOLDERS:
+        candidates.append(SYNC_ROOT / desk)
+    return [str(c) for c in candidates if c.is_dir() and desk_for(str(c)).casefold() == wanted]
+
+
+def desk_folder(desk: str, desktop: dict) -> tuple:
+    """The folder a new session for this desk starts in. Home: the home folder. A desk of the synced tree: its folder
+    there (since 2026-10-30; before, the newest session's folder, which on Moosfels was the retired Steward's, removed
+    that morning, so mail for a new session on its ClaudeMail desk waited for the user). Two folders that are the same
+    desk (two dated folders of one name) are not guessed between. A desk outside the tree: the newest desktop
+    session's folder on it, any age, archived included. (folder, '') or ('', why there is none)."""
     if desk.casefold() == HOME_DESK.casefold():
-        return str(Path.home())
+        return str(Path.home()), ""
+    synced = tree_folders(desk)
+    if len(synced) > 1:
+        return "", "the desk " + desk + " is more than one folder here (" + ", ".join(synced) + "), and none is picked"
+    if synced:
+        return synced[0], ""
     folders = [r["cwd"] for r in sorted(desktop.values(), key=lambda r: r["lastActivityAt"])
                if store_desk(r["cwd"]).casefold() == desk.casefold()]
-    return folders[-1] if folders else ""
+    if folders:
+        return folders[-1], ""
+    return "", ("the desk " + desk + " is no folder of the synced tree here and no desktop session has run on it, so"
+                " there is no folder to open a session in")
 
 
 def open_new_session(folder: str, session: str, title: str) -> str:
@@ -945,10 +1019,9 @@ def deliver(machine: str, desk: str, message: Path, config: dict, running: dict,
         write_status(message, dict(status, state="opening", session=target, host=record["sessionId"], opened=now_iso()))
         log(machine, "opened session " + record["sessionId"] + " (" + record.get("title", "") + ") for " + message.name)
         return
-    folder = desk_folder(desk, desktop)
+    folder, why = desk_folder(desk, desktop)
     if not folder:
-        return to_user(machine, desk, message, header, status, "no desktop session has ever run on the desk " + desk
-                       + " here, so there is no folder to open a session in")
+        return to_user(machine, desk, message, header, status, why)
     # The id is written down before the command-line Claude runs, so a dispatcher that dies meanwhile finds that
     # session on its next pass instead of opening another.
     session = str(uuid.uuid4())
@@ -974,9 +1047,12 @@ def to_user(machine: str, desk: str, message: Path, header: dict, status: dict, 
 
 
 def undelivered(machine: str) -> dict:
-    """How many messages the dispatcher has seen and not yet delivered, how many of them wait for the user, the oldest."""
-    waiting = [(read_status(p), p) for f in desk_folders(machine) for p in waiting_in(f) if status_path(p).is_file()]
-    found = {"count": len(waiting), "waiting_for_user": sum(st["state"] == WAITING_FOR_USER for st, _ in waiting)}
+    """How many messages lie undelivered on this machine's desks, how many of them the dispatcher has not seen yet (mail
+    piling up behind a crash, 2026-10-28), how many wait for the user, and the oldest it has seen."""
+    messages = [p for f in desk_folders(machine) for p in waiting_in(f)]
+    waiting = [(read_status(p), p) for p in messages if status_path(p).is_file()]
+    found = {"count": len(messages), "unseen": len(messages) - len(waiting),
+             "waiting_for_user": sum(st["state"] == WAITING_FOR_USER for st, _ in waiting)}
     if waiting:
         status, path = max(waiting, key=lambda item: age(item[0]["arrived"]))
         found.update(oldest=message_id(path), oldest_arrived=status["arrived"], oldest_desk=path.parent.name)
@@ -1021,18 +1097,73 @@ def notify(machine: str, title: str, body: str) -> None:
 
 # ---------------------------------------------------------------- dispatcher
 
+CODE_FILES = [SCRIPT, SERVICE_DIR / "signed_mail.py"]                # a change to either restarts the dispatcher
+
+
 def code_version() -> str:
-    stat = SCRIPT.stat()
-    return str(stat.st_mtime_ns) + "-" + str(stat.st_size)
+    """mtime-size of mail.py, and since 2026-10-30 '+' mtime-size of signed_mail.py, whose changes were never picked up."""
+    return "+".join(str(s.st_mtime_ns) + "-" + str(s.st_size) for s in (f.stat() for f in CODE_FILES))
 
 
 def code_compiles() -> bool:
-    """Only restart onto a mail.py that compiles: Resilio may still be writing it."""
+    """Only restart onto code that compiles: Resilio may still be writing it."""
     try:
-        compile(SCRIPT.read_text(encoding="utf-8"), str(SCRIPT), "exec")
+        for path in CODE_FILES:
+            compile(path.read_text(encoding="utf-8"), str(path), "exec")
     except (SyntaxError, ValueError):
         return False
     return True
+
+
+def settings_problem() -> str:
+    """Claude Code ignores a settings file it cannot parse, and with it auto mode and the hooks registered there (the
+    app on Altiplano, 2026-10-27 13:35 to 10-30 01:52, while the file began with a UTF-8 BOM). '' when
+    ~/.claude/settings.json parses as plain UTF-8 JSON or does not exist, else why not: a known condition whose decided
+    response is the report and one notification (design R7)."""
+    path = Path.home() / ".claude" / "settings.json"
+    if not path.is_file():
+        return ""
+    try:
+        json.loads(path.read_bytes().decode("utf-8"))
+    except (UnicodeDecodeError, json.JSONDecodeError) as error:
+        return display(path) + " does not parse, so Claude Code ignores it: " + str(error)
+    return ""
+
+
+def prune_logs(machine: str, config: dict) -> None:
+    """Daily logs older than log_keep_days go (none was ever pruned before 2026-10-30)."""
+    cutoff = (datetime.date.today() - datetime.timedelta(days=int(config["log_keep_days"]))).strftime("%y%m%d")
+    for path in LOG_DIR.glob("claudemail." + machine.casefold() + ".*.log"):
+        if path.name.split(".")[2] < cutoff:
+            path.unlink()
+
+
+def peer_stamps(machine: str, config: dict) -> dict:
+    """The newest report this machine sees from every other one, so that any machine can tell a one-way sync."""
+    return {m: names[0].stem for m in config["machines"] if m != machine for names in [report_names(m)] if names}
+
+
+def record_crash(machine: str, version: str, error: Exception, config: dict) -> None:
+    """The dispatcher ends on an exception. Before it does: count it machine-locally (since, restarts, where), and
+    write a report saying so when the kind of crash is new or the last report is older than report_minutes, so that
+    senders, the hook and the supervisor see a crash loop instead of a silent machine (Altiplano 2026-10-28, 1,204
+    restarts and no report for 10.5 hours). The traceback goes to the watcher's log, as before."""
+    ours = (Path(__file__).name, "signed_mail.py")
+    frame = [f for f in traceback.extract_tb(error.__traceback__) if Path(f.filename).name in ours][-1]
+    signature = type(error).__name__ + " at " + Path(frame.filename).name + ":" + str(frame.lineno) + " in " + frame.name
+    path = LOCAL_DIR / CRASH_FILE
+    crash = read_json(path) if path.is_file() else {"signature": ""}          # "": no crash on record
+    if crash["signature"] == signature and age(crash["last"]) < 600:
+        crash["restarts"] += 1
+    else:
+        crash = {"signature": signature, "since": now_iso(), "restarts": 1}
+    crash.update(error=" ".join(str(error).split())[:300], version=version, last=now_iso())
+    write_json(path, crash)
+    newest = read_report(machine)
+    if ("crash" not in newest or newest["crash"]["signature"] != signature
+            or age(newest["updated"]) > 60 * float(config["report_minutes"])):
+        write_report(machine, dict(newest, machine=machine, pid=os.getpid(), version=version, protocol=PROTOCOL,
+                                   crash=crash, updated=now_iso()))
 
 
 def local_heartbeat() -> Path:
@@ -1060,7 +1191,19 @@ def cmd_dispatch(args, config: dict) -> None:
         sys.exit(EXIT_ALREADY_RUNNING)
     version = code_version()
     log(machine, "dispatcher started (pid " + str(os.getpid()) + ", mail.py " + version + ")")
-    last_report, last_beat = 0.0, 0.0
+    try:
+        prune_logs(machine, config)
+        dispatch_loop(machine, version)
+    except Exception as error:                               # recorded, then raised again: the dispatcher still ends here
+        record_crash(machine, version, error, config)
+        raise
+
+
+def dispatch_loop(machine: str, version: str) -> None:
+    """Deliver, then report. A report is written when what senders rely on changes (the sessions, their titles and
+    whether they run, the desks, the undelivered mail, the dispatcher's own state), else every report_minutes: one a
+    minute left some 40,000 deleted files per report folder for every Resilio peer to walk (2026-10-30)."""
+    last_key, last_report, last_beat = "", 0.0, 0.0
     while True:
         config = load_config()
         write_json(local_heartbeat(), {"pid": os.getpid(), "version": version, "updated": now_iso()})
@@ -1068,51 +1211,81 @@ def cmd_dispatch(args, config: dict) -> None:
         for folder in desk_folders(machine):
             for message in waiting_in(folder):
                 deliver(machine, folder.name, message, config, running, desktop)
+        new_code = code_version() != version
+        if new_code and code_compiles():
+            log(machine, "mail.py changed; dispatcher restarting onto the new code")
+            sys.exit(EXIT_CODE_CHANGED)
+        settings = settings_problem()
+        told = LOCAL_DIR / "settings_notified.json"                  # once per problem, across restarts and deploys
+        if settings != (read_json(told)["problem"] if told.is_file() else ""):
+            if settings:
+                notify(machine, "Claude Code settings unreadable", settings)
+            write_json(told, {"problem": settings, "at": now_iso()})
         sessions, desks = session_listing(config)
-        listing = {"sessions": sessions, "desks": desks, "undelivered": undelivered(machine)}
-        if time.time() - last_report > 60:              # every minute, not on each change: sessions turn busy and idle all day
-            write_report(machine, dict(listing, machine=machine, pid=os.getpid(), version=version, updated=now_iso()))
-            last_report = time.time()
+        listing = {"sessions": sessions, "desks": desks, "undelivered": undelivered(machine), "settings_problem": settings,
+                   "new_code_does_not_compile": new_code}
+        key = json.dumps([sorted([s["session"], s["desk"], s["title"], s["state"] == "closed"] for s in sessions),
+                          sorted(desks.items()), listing["undelivered"], settings, new_code], sort_keys=True)
+        if key != last_key or time.time() - last_report > 60 * float(config["report_minutes"]):
+            write_report(machine, dict(listing, machine=machine, pid=os.getpid(), version=version, protocol=PROTOCOL,
+                                       seen=peer_stamps(machine, config), updated=now_iso()))
+            last_key, last_report = key, time.time()
+        crash = LOCAL_DIR / CRASH_FILE
+        if crash.is_file():                                  # a whole pass, report included, went through
+            log(machine, "dispatcher recovered: a pass completed after " + crash_line(read_json(crash)))
+            crash.unlink()
         if time.time() - last_beat > 60 * float(config["heartbeat_minutes"]):
             waiting = listing["undelivered"]
             log(machine, "heartbeat: " + str(len([s for s in sessions if s["state"] != "closed"])) + " sessions running, "
                 + str(waiting["count"]) + " undelivered" + (", the oldest " + waiting["oldest"] + " on " + waiting["oldest_desk"]
-                                                            if waiting["count"] else ""))
+                                                            if "oldest" in waiting else ""))
             last_beat = time.time()
-        if code_version() != version and code_compiles():
-            log(machine, "mail.py changed; dispatcher restarting onto the new code")
-            sys.exit(EXIT_CODE_CHANGED)
         time.sleep(float(config["poll_seconds"]))
 
 
 def cmd_watch(args, config: dict) -> None:
     """What the scheduled task / LaunchAgent runs: keeps a dispatcher child running and starts it again when it exits,
-    at once after a code change. A dispatcher that fails leaves its traceback in the log; the next try is 30 s later."""
+    at once after a code change. A dispatcher that fails leaves its traceback in the log, once while it repeats; the
+    next try is 30 s later. On the Mac the watcher itself ends on a code change, and launchd (KeepAlive) starts it again
+    on the new code, so a watcher never runs older code than its dispatcher (Altiplano's ran v3 code from 2026-10-25 to
+    10-30). On Windows a kick from inside the task may end with it (untested), so there it stays until the next kick."""
     machine = this_machine(config)
     log(machine, "watch started (pid " + str(os.getpid()) + ")")
     errors = LOCAL_DIR / "dispatcher.err"
+    last_error = ""
     while True:
         with open(errors, "w", encoding="utf-8") as err:
             code = subprocess.call([sys.executable, "-B", str(SCRIPT), "dispatch"], stderr=err,
                                    creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0))
+        if code == EXIT_CODE_CHANGED and sys.platform == "darwin":
+            log(machine, "watch ends for launchd to start it again on the new code")
+            sys.exit(0)
         if code == EXIT_CODE_CHANGED:
             continue
         if code == EXIT_ALREADY_RUNNING:
             time.sleep(60)
             continue
-        log(machine, "ERROR dispatcher exited with code " + str(code) + ":\n" + errors.read_text(encoding="utf-8")[-3000:])
+        text = errors.read_text(encoding="utf-8", errors="replace")[-3000:]     # pythonw on Windows writes cp1252
+        log(machine, "ERROR dispatcher exited with code " + str(code) + (":\n" + text if text != last_error else ", the same error"))
+        last_error = text
         time.sleep(30)
 
 
 def check_dispatcher(machine: str, config: dict) -> None:
-    """From the prompt hook: if this machine's dispatcher has not reported for three minutes, restart its task in the
-    background, at most every kick_every_minutes."""
-    beat, marker = local_heartbeat(), LOCAL_DIR / "kick.json"
-    if beat.is_file() and age(read_json(beat)["updated"]) < 180:
+    """From the prompt hook, at most every kick_every_minutes: if this machine's dispatcher is crash-looping, say so in
+    the session (a restart would only crash again); else if it has not reported for three minutes, restart its task
+    in the background."""
+    beat, marker, crash = local_heartbeat(), LOCAL_DIR / "kick.json", LOCAL_DIR / CRASH_FILE
+    looping = crash.is_file() and age(read_json(crash)["last"]) < 180
+    if not looping and beat.is_file() and age(read_json(beat)["updated"]) < 180:
         return
     if marker.is_file() and age(read_json(marker)["at"]) < 60 * float(config["kick_every_minutes"]):
         return
     write_json(marker, {"at": now_iso()})
+    if looping:
+        print("ClaudeMail on " + machine + ": the " + crash_line(read_json(crash)) + ". The traceback is in "
+              + display(LOG_DIR) + "; tell the user if this session cannot fix it.")
+        return
     flags = (subprocess.CREATE_NO_WINDOW | subprocess.DETACHED_PROCESS | subprocess.CREATE_NEW_PROCESS_GROUP
              if sys.platform == "win32" else 0)
     subprocess.Popen([sys.executable, "-B", str(SCRIPT), "kick"], stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL,

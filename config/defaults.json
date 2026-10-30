@@ -1,13 +1,23 @@
 {
-  "_about": "ClaudeMail settings shared by every machine. A machine overrides any of them in config/<machine>.json (lower case, e.g. config/stahlwerk.json), which only that machine edits. 'machines' are the folder names under mail/; 'hostnames' maps a hostname that is not simply the machine name onto one of them (the CLAUDE_MAILBOX_MACHINE environment variable overrides both). open_minutes: how long an opened session may take to start before its mail waits for the user; retry_minutes: how often such mail is tried again.",
-  "machines": ["Mistral", "Moosfels", "Stahlwerk", "Teppich", "Altiplano", "Sandbank", "Pulvermaar"],
+  "_about": "ClaudeMail settings shared by every machine. A machine overrides any of them in config/<machine>.json (lower case, e.g. config/stahlwerk.json), which only that machine edits. 'machines' are the folder names under mail/; 'hostnames' maps a hostname that is not simply the machine name onto one of them (the CLAUDE_MAILBOX_MACHINE environment variable overrides both). open_minutes: how long an opened session may take to start before its mail waits for the user; retry_minutes: how often such mail is tried again. report_minutes: a report is written when what senders rely on changes, else at this interval; stale_minutes: a machine whose newest report is older than this counts as silent (above report_minutes); log_keep_days: older daily logs are deleted at dispatcher start.",
+  "machines": [
+    "Mistral",
+    "Moosfels",
+    "Stahlwerk",
+    "Teppich",
+    "Altiplano",
+    "Sandbank",
+    "Pulvermaar"
+  ],
   "hostnames": {},
   "poll_seconds": 5,
   "open_minutes": 3,
   "retry_minutes": 60,
-  "stale_minutes": 6,
+  "stale_minutes": 25,
   "kick_every_minutes": 20,
   "heartbeat_minutes": 60,
   "inject_max_chars": 12000,
-  "session_keep_days": 30
+  "session_keep_days": 30,
+  "report_minutes": 10,
+  "log_keep_days": 30
 }
