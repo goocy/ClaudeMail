@@ -72,7 +72,7 @@ REPORTS = "reports"
 STATUS_SUFFIX = ".delivery.json"                                    # .status.json until v3: left alone
 GROUP_FOLDERS = ["Services", "Projects", "Tools"]
 HEADER_FIELDS = ["from", "from_session", "to", "for_session", "session_name", "subject", "sent", "id", "conversation",
-                 "in_reply_to", "protocol"]
+                 "in_reply_to", "protocol", "expires_minutes"]
 HOOK_EVENTS = ["SessionStart", "UserPromptSubmit"]
 TASK_NAME = "Claude Mail Watcher"
 LAUNCHD_LABEL = "com.goocy.claudemail"
@@ -89,7 +89,7 @@ DELIVER_SECONDS = 150                                               # one messag
 SLIM_RECORD = ("sessionId", "cliSessionId", "title", "cwd", "lastActivityAt", "isArchived")   # what delivery reads
 REQUIRED_FIELDS = ["from", "subject", "sent", "id"]                 # what deliver needs; send checks the same
 V4_START = datetime.datetime(2026, 10, 26, 15, 48, tzinfo=datetime.timezone(datetime.timedelta(hours=-5)))
-HELD = "held"                                                       # mail from before version 4, set aside per desk
+HELD = "held"                                                       # set aside per desk: mail from before version 4, and expired mail
 APP_LOG = (Path(os.environ["LOCALAPPDATA"]) / "Claude" / "logs" / "main.log" if sys.platform == "win32"   # Moosfels, 2026-10-30
            else Path.home() / "Library" / "Logs" / "Claude" / "main.log")
 
@@ -808,6 +808,11 @@ def cmd_send(args, config: dict) -> None:
     if not body.strip():
         raise SystemExit("Empty body.")
     header["sent"] = now_iso()
+    if args.expires_minutes is not None:
+        # Shorter than the time an opened session gets to start, mail would expire while its session opens, unseen.
+        assert args.expires_minutes > float(config["open_minutes"]), "--expires-minutes must exceed open_minutes (" \
+            + str(config["open_minutes"]) + ")"
+        header["expires_minutes"] = str(args.expires_minutes)
     # Every file is written before anything is printed: output cut short (PowerShell's Select-Object -First ends the
     # process once it has its lines) must not leave a fan-out half sent.
     letters = []
@@ -1126,11 +1131,29 @@ def deliver(machine: str, desk: str, message: Path, config: dict, running: dict,
         # nothing. The report counts held mail (undelivered.held) instead.
         return log(machine, "held " + message.name + " on " + desk + ": sent " + header["sent"] + ", before version 4")
     status = read_status(message)
+    lifetime = datetime.timedelta(minutes=float(header.get("expires_minutes") or config["expires_minutes"]))
     if not status:
-        status = {"state": "new", "arrived": now_iso()}
+        arrived = datetime.datetime.now().astimezone().replace(microsecond=0)
+        # One write with both times, so every record this code makes names its expiry (to_user reads it).
+        status = {"state": "new", "arrived": arrived.isoformat(), "expires": (arrived + lifetime).isoformat()}
         write_status(message, status)
         log(machine, "arrived " + message.name + " on " + desk + " from " + header["from"] + " for "
             + (header["for_session"] if header.get("for_session") else "a new session") + ": " + header["subject"])
+    if "expires" not in status:          # mail that was waiting when this code arrived: an hour from its arrival
+        status = dict(status, expires=(datetime.datetime.fromisoformat(status["arrived"]) + lifetime).isoformat(timespec="seconds"))
+        write_status(message, status)
+    if datetime.datetime.fromisoformat(status["expires"]) <= datetime.datetime.now().astimezone():
+        # Mail undelivered this long after it arrived here is set aside (the user, 2026-11-06: "set the expiry time to an
+        # hour by default, and it can be overridden"). Retrying it would only bring the app to the front, restore an
+        # archived session, and add one more process at the app's cap: on Moosfels 25 dead LifeCoordinator jobs were
+        # retried hourly from 2026-11-02 to 2026-11-06. Counted from arrival, so a machine that was asleep still gets
+        # its mail. The sender was told when it first waited (to_user), so no second notice.
+        target = message.parent / HELD / message.name
+        target.parent.mkdir(exist_ok=True)
+        move(status_path(message), status_path(target))
+        write_status(target, dict(status, state="expired", expired_at=now_iso()))
+        move(message, target)
+        return log(machine, "held " + message.name + " on " + desk + ": it expired undelivered at " + status["expires"])
     target = status.get("session") or header.get("for_session", "")
     entry = running.get(target) or running.get(status.get("host", ""))
     # A process entry whose inbox refused a post is not tried again until retry_minutes have passed; a newer process of
@@ -1213,12 +1236,13 @@ def to_user(machine: str, desk: str, message: Path, header: dict, status: dict, 
     log(machine, message.name + " on " + desk + " waits for the user: " + why)
     if first:
         notify(machine, "Claude mail waits on " + desk, "From " + header["from"] + ": " + header.get("subject", "")
-               + "\n" + why + ". `mail.py inbox` lists it.")
+               + "\n" + why + ". `mail.py inbox` lists it; unless delivered, it expires " + status["expires"] + ".")
         notice_to_sender(machine, desk, message, header, "waits for the user on " + machine + ": " + why,
                          "Try to get it delivered another way first: send it again with --for-session to a session that"
                          " runs there (`mail.py sessions " + machine + ":" + desk + "` lists them) or with --new, or ask"
-                         " the user to open the session it waits for. It is tried again every hour meanwhile; if you send"
-                         " it again, say so in your copy, since this one may still arrive.")
+                         " the user to open the session it waits for. Until " + status["expires"] + " it is tried again"
+                         " every hour and may still arrive (if you send it again, say so in your copy); after that it"
+                         " expires and is set aside undelivered.")
 
 
 def undelivered(machine: str) -> dict:
@@ -1642,6 +1666,8 @@ def main() -> None:
     p.add_argument("--subject")
     p.add_argument("--body-file")
     p.add_argument("--reply-to", help="path or id of the message being answered; goes to the session that sent it")
+    p.add_argument("--expires-minutes", type=float, help="mail not delivered this many minutes after it arrives is set aside"
+                   " in held/ instead of being tried again; default the config's expires_minutes (60)")
     p.add_argument("--signed", help="envelope file from signed_command.py sign; a --body-file becomes a note beside it")
     p.add_argument("--to-own-desk", action="store_true", help=argparse.SUPPRESS)   # LeaseResources passes it; no effect
     p = sub.add_parser("sessions", help="the sessions on a machine or desk, to pick the one a message is for")
