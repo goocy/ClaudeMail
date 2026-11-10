@@ -1180,6 +1180,27 @@ def other_account(session: str) -> str:
     return ""
 
 
+def stamped_status(machine: str, desk: str, message: Path, header: dict, config: dict) -> dict:
+    """The message's status record with its arrival and expiry in it: made at the first look (logging the arrival), or
+    completed for a record made before expiry existed. Called by deliver, and by deliver_isolated when a delivery child
+    was cut off before it got that far, because to_user reads the expiry. On Pektolith on 2026-11-09 the first delivery
+    of a message ran past DELIVER_SECONDS on a thrashing Mac, the parent handed to_user an empty record, and the
+    dispatcher crash-looped on KeyError 'expires' while the message waited."""
+    status = read_status(message)
+    lifetime = datetime.timedelta(minutes=float(header.get("expires_minutes") or config["expires_minutes"]))
+    if not status:
+        arrived = datetime.datetime.now().astimezone().replace(microsecond=0)
+        # One write with both times, so every record this code makes names its expiry (to_user reads it).
+        status = {"state": "new", "arrived": arrived.isoformat(), "expires": (arrived + lifetime).isoformat()}
+        write_status(message, status)
+        log(machine, "arrived " + message.name + " on " + desk + " from " + header["from"] + " for "
+            + (header["for_session"] if header.get("for_session") else "a new session") + ": " + header["subject"])
+    if "expires" not in status:          # mail that was waiting when this code arrived: an hour from its arrival
+        status = dict(status, expires=(datetime.datetime.fromisoformat(status["arrived"]) + lifetime).isoformat(timespec="seconds"))
+        write_status(message, status)
+    return status
+
+
 def deliver(machine: str, desk: str, message: Path, config: dict, running: dict, desktop: dict) -> None:
     """Move one message on: delivered to its running session, or that session opened, or a new one; after open_minutes
     without success it waits for the user, and is tried again every retry_minutes."""
@@ -1203,18 +1224,7 @@ def deliver(machine: str, desk: str, message: Path, config: dict, running: dict,
         # No notice to its sender: the sessions that sent such mail are a month old, and a notice would wake them for
         # nothing. The report counts held mail (undelivered.held) instead.
         return log(machine, "held " + message.name + " on " + desk + ": sent " + header["sent"] + ", before version 4")
-    status = read_status(message)
-    lifetime = datetime.timedelta(minutes=float(header.get("expires_minutes") or config["expires_minutes"]))
-    if not status:
-        arrived = datetime.datetime.now().astimezone().replace(microsecond=0)
-        # One write with both times, so every record this code makes names its expiry (to_user reads it).
-        status = {"state": "new", "arrived": arrived.isoformat(), "expires": (arrived + lifetime).isoformat()}
-        write_status(message, status)
-        log(machine, "arrived " + message.name + " on " + desk + " from " + header["from"] + " for "
-            + (header["for_session"] if header.get("for_session") else "a new session") + ": " + header["subject"])
-    if "expires" not in status:          # mail that was waiting when this code arrived: an hour from its arrival
-        status = dict(status, expires=(datetime.datetime.fromisoformat(status["arrived"]) + lifetime).isoformat(timespec="seconds"))
-        write_status(message, status)
+    status = stamped_status(machine, desk, message, header, config)
     if datetime.datetime.fromisoformat(status["expires"]) <= datetime.datetime.now().astimezone():
         # Mail undelivered this long after it arrived here is set aside (the user, 2026-11-06: "set the expiry time to an
         # hour by default, and it can be overridden"). Retrying it would only bring the app to the front, restore an
@@ -1540,7 +1550,7 @@ def deliver_isolated(machine: str, desk: str, message: Path, running: dict, desk
     except subprocess.TimeoutExpired:
         if message.is_file():                                # not claimed: it waits, and is tried again in an hour
             header, _ = read_message(message)
-            return to_user(machine, desk, message, header, read_status(message),
+            return to_user(machine, desk, message, header, stamped_status(machine, desk, message, header, config),
                            "its delivery did not end within " + str(DELIVER_SECONDS) + " s")
         return delivery_failed(machine, desk, message, version, "no end within " + str(DELIVER_SECONDS) + " s", "")
     if run.returncode == 0:
