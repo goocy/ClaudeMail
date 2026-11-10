@@ -37,6 +37,7 @@ Stdlib only; Python 3.8+ on Windows and macOS. No regular expressions (house rul
 """
 from __future__ import annotations
 
+import functools
 import argparse
 import base64
 import datetime
@@ -640,6 +641,27 @@ def session_listing(config: dict) -> tuple:
 
 REPORT_SLOTS = 5
 CLOCK_AHEAD_SECONDS = 120
+POSTMAN_DIR = SERVICE_DIR.parent / "Postman"                        # Services/Postman, beside this service
+POSTMAN_SERVICE = "ClaudeMail"                                      # the name these reports carry in the postman's spool
+
+
+def reports_via(config: dict) -> str:
+    """Where reports are written and read: 'files', the slots under mail/<Machine>/reports that Resilio carries, or
+    'postman', the machine-local spool of Services/Postman that carries them over Tailscale (design 261110 Tailscale
+    substrate, step 2). The key has no default: every machine must say which."""
+    via = config["reports_via"]
+    assert via in ("files", "postman"), "reports_via is 'files' or 'postman', not " + repr(via)
+    return via
+
+
+@functools.lru_cache(maxsize=None)
+def report_spool():
+    """This machine's postman spool. postman.py is imported only here, so a machine whose reports go by files never
+    loads it, and one without a running postman fails at its first report (the spool has no whoami.json)."""
+    if str(POSTMAN_DIR) not in sys.path:
+        sys.path.insert(0, str(POSTMAN_DIR))
+    import postman
+    return postman.Spool(postman.spool_root(), postman.load_config())
 
 
 def report_slots(machine: str) -> list:
@@ -659,10 +681,13 @@ def file_time(path: Path) -> float:
         return float("-inf")
 
 
-def report_entries(machine: str) -> list:
+def report_entries(machine: str, config: dict) -> list:
     """[(path, report)] of a machine's reports that parse, newest first: by the `updated` time written inside (ISO with
     its offset, so a time zone change or the DST fall-back does not reorder them), then by file time; never by name.
-    The <stamp>.json files of the code before slots are read the same way until their machine deletes them."""
+    The <stamp>.json files of the code before slots are read the same way until their machine deletes them. Through
+    the postman a machine has at most one report, the newest its spool holds (higher seq wins there), and no file."""
+    if reports_via(config) == "postman":
+        return [(None, s["body"]) for s in report_spool().states(POSTMAN_SERVICE) if s["origin"] == machine]
     folder = machine_dir(machine) / REPORTS
     if not folder.is_dir():
         return []
@@ -684,15 +709,15 @@ def report_entries(machine: str) -> list:
     return [(path, report) for _, _, path, report in entries]
 
 
-def report_names(machine: str) -> list:
+def report_names(machine: str, config: dict) -> list:
     """A machine's report files that parse, newest first (report_entries)."""
-    return [path for path, _ in report_entries(machine)]
+    return [path for path, _ in report_entries(machine, config)]
 
 
-def read_report(machine: str) -> dict:
+def read_report(machine: str, config: dict) -> dict:
     """The newest report of a machine; {} when it has none. Every report is written under a temp name and renamed, so a
     listed one is complete."""
-    entries = report_entries(machine)
+    entries = report_entries(machine, config)
     return entries[0][1] if entries else {}
 
 
@@ -702,13 +727,19 @@ def report_time() -> str:
     return datetime.datetime.now().astimezone().isoformat(timespec="milliseconds")
 
 
-def write_report(machine: str, report: dict) -> bool:
+def write_report(machine: str, report: dict, config: dict) -> bool:
     """Overwrites the oldest of the five slots (report_slots says why) through a temp name and a rename, then deletes
     any other report file there, the <stamp>.json of the code before; after that nothing is ever deleted. Slots with a
     file time more than CLOCK_AHEAD_SECONDS in the future were written while this clock ran ahead (Teppich, 2026-10-30:
     three hours); readers would take them as newest for as long, so the report goes into all of them at once. A slot
     Resilio holds past write_json's retries (Windows) is skipped for the next oldest; with none writable the report is
-    left out and logged, and False tells the dispatcher to try again on its next pass."""
+    left out and logged, and False tells the dispatcher to try again on its next pass. Through the postman the report
+    is published into the spool instead, and none of that applies: it is written or it raises."""
+    if reports_via(config) == "postman":
+        spool = report_spool()
+        assert spool.me() == machine, "ClaudeMail runs as " + machine + ", this machine's postman as " + spool.me()
+        spool.publish(POSTMAN_SERVICE, report)
+        return True
     now = time.time()
     slots = sorted(report_slots(machine), key=file_time)            # oldest first; an empty slot before any other
     ahead = [p for p in slots if file_time(p) > now + CLOCK_AHEAD_SECONDS]
@@ -744,7 +775,7 @@ def machine_view(machine: str, config: dict) -> dict:
     if machine == this_machine(config):
         sessions, desks = session_listing(config)
         return {"sessions": sessions, "desks": desks, "as_of": "", "warning": warning}
-    report = read_report(machine)
+    report = read_report(machine, config)
     if "sessions" not in report:
         desks = {f.name: "(not reported yet)" for f in desk_folders(machine)}
         return {"sessions": [], "desks": dict(desks, **{HOME_DESK: "its home folder"}), "warning": warning,
@@ -775,7 +806,7 @@ def dispatcher_warning(machine: str, config: dict) -> str:
     if machine == here:
         crash = LOCAL_DIR / CRASH_FILE
         return crash_line(read_json(crash)) if crash.is_file() and age(read_json(crash)["last"]) < 180 else ""
-    report = read_report(machine)
+    report = read_report(machine, config)
     if "updated" not in report:
         return machine + "'s dispatcher has never reported; mail waits until it runs"
     limit = 60 * float(config["stale_minutes"])
@@ -823,7 +854,7 @@ def print_sessions(machine: str, view: dict, desk=None) -> None:
 def cmd_sessions(args, config: dict) -> None:
     if not args.target:
         for machine in config["machines"]:
-            if machine == this_machine(config) or report_names(machine):
+            if machine == this_machine(config) or report_names(machine, config):
                 print_sessions(machine, machine_view(machine, config))
         return
     machine_part, _, desk_part = args.target.partition(":")
@@ -1424,10 +1455,12 @@ def prune_logs(machine: str, config: dict) -> None:
 
 def report_stamp(path: Path, report: dict) -> str:
     """When a report was written, as the UTC stamp its file name was before slots (yymmdd-HHMMSS-mmmZ), from its
-    `updated`, else its file time: peers' dispatcher_warning, on this code and the code before, parse that form."""
+    `updated`, else its file time: peers' dispatcher_warning, on this code and the code before, parse that form. A
+    report through the postman has no file (path None) and was written by this code, so it always has `updated`."""
     try:
         when = datetime.datetime.fromisoformat(str(report.get("updated"))).astimezone(datetime.timezone.utc)
     except (TypeError, ValueError, OverflowError, OSError):
+        assert path is not None, "a report from the postman without a usable `updated`: " + repr(report.get("updated"))
         try:
             when = datetime.datetime.fromtimestamp(path.stat().st_mtime, datetime.timezone.utc)
         except (OSError, OverflowError, ValueError):          # gone since it was read (Resilio): never seen, as before
@@ -1438,7 +1471,7 @@ def report_stamp(path: Path, report: dict) -> str:
 def peer_stamps(machine: str, config: dict) -> dict:
     """The newest report this machine sees from every other one, so that any machine can tell a one-way sync."""
     stamps = {m: report_stamp(*entries[0]) for m in config["machines"] if m != machine
-              for entries in [report_entries(m)] if entries}
+              for entries in [report_entries(m, config)] if entries}
     return {m: stamp for m, stamp in stamps.items() if stamp}
 
 
@@ -1459,11 +1492,11 @@ def record_crash(machine: str, version: str, error: Exception, config: dict) -> 
         crash = {"signature": signature, "since": now_iso(), "restarts": 1}
     crash.update(error=" ".join(str(error).split())[:300], version=version, last=now_iso())
     write_json(path, crash)
-    newest = read_report(machine)
+    newest = read_report(machine, config)
     if ("crash" not in newest or newest["crash"]["signature"] != signature
             or age(newest["updated"]) > 60 * float(config["report_minutes"])):
         write_report(machine, dict(newest, machine=machine, pid=os.getpid(), version=version, protocol=PROTOCOL,
-                                   crash=crash, updated=report_time()))
+                                   crash=crash, updated=report_time()), config)
 
 
 def local_heartbeat() -> Path:
@@ -1637,7 +1670,7 @@ def dispatch_loop(machine: str, version: str) -> None:
         if key != last_key or time.time() - last_report > 60 * float(config["report_minutes"]):
             published = write_report(machine, dict(listing, machine=machine, pid=os.getpid(), version=version,
                                                    protocol=PROTOCOL, seen=peer_stamps(machine, config),
-                                                   updated=report_time()))
+                                                   updated=report_time()), config)
             if published:                                    # else tried again on the next pass
                 last_key, last_report = key, time.time()
         crash = LOCAL_DIR / CRASH_FILE

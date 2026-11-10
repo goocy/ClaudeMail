@@ -23,6 +23,7 @@ scratch = Path(tempfile.mkdtemp(prefix="claudemail-clock-"))
 mail.MAILBOX_ROOT = scratch
 folder = scratch / "Testmachine" / mail.REPORTS
 folder.mkdir(parents=True)
+files = {"reports_via": "files"}                  # the slots through Resilio; tests/postman_reports.py covers the postman
 
 
 def set_zone(zone: str) -> None:
@@ -45,20 +46,20 @@ for minutes in [3, 2, 1]:                       # reports of the code before: lo
     old = folder / (local - datetime.timedelta(minutes=minutes)).strftime("%y%m%d-%H%M%S-000.json")
     old.write_text(json.dumps({"n": -1}))
     os.utime(old, (time.time() - 60 * minutes,) * 2)
-mail.write_report("Testmachine", {"n": 0, "updated": mail.now_iso()})
-expect("a report written on European time is the newest", mail.read_report("Testmachine")["n"] == 0)
+mail.write_report("Testmachine", {"n": 0, "updated": mail.now_iso()}, files)
+expect("a report written on European time is the newest", mail.read_report("Testmachine", files)["n"] == 0)
 set_zone("America/Bogota")                     # the local clock goes back 6 hours
 for n in range(1, 8):
     time.sleep(0.01)
-    mail.write_report("Testmachine", {"n": n, "updated": mail.now_iso()})
+    mail.write_report("Testmachine", {"n": n, "updated": mail.now_iso()}, files)
     names = sorted(p.name for p in folder.glob("*.json"))
-    expect("report " + str(n) + " after the clock went back is kept and read", mail.read_report("Testmachine")["n"] == n, names)
+    expect("report " + str(n) + " after the clock went back is kept and read", mail.read_report("Testmachine", files)["n"] == n, names)
 expect("five reports kept, the five slots", names == ["slot-%d.json" % i for i in range(5)], names)
 expect("the leftover local-time reports are gone", all(json.loads((folder / n).read_text())["n"] >= 0 for n in names), names)
 expect("the kept ones are the last five written", sorted(json.loads((folder / n).read_text())["n"] for n in names) == [3, 4, 5, 6, 7], names)
 inodes = {n: (folder / n).stat().st_ino for n in names}
-mail.write_report("Testmachine", {"n": 8, "updated": mail.now_iso()})
-expect("report 8 is read", mail.read_report("Testmachine")["n"] == 8)
+mail.write_report("Testmachine", {"n": 8, "updated": mail.now_iso()}, files)
+expect("report 8 is read", mail.read_report("Testmachine", files)["n"] == 8)
 expect("report 8 replaced the oldest slot, the one holding report 3",
        [json.loads((folder / n).read_text())["n"] for n in names].count(3) == 0, names)
 expect("still exactly the five slots", sorted(p.name for p in folder.glob("*.json")) == names)
@@ -70,12 +71,12 @@ for n in ["slot-1.json", "slot-3.json"]:
     future = datetime.datetime.fromtimestamp(ahead).astimezone().isoformat(timespec="seconds")
     (folder / n).write_text(json.dumps({"n": 100, "updated": future}))
     os.utime(folder / n, (ahead, ahead))
-expect("a report written while the clock ran ahead reads as newest", mail.read_report("Testmachine")["n"] == 100)
-mail.write_report("Testmachine", {"n": 9, "updated": mail.now_iso()})
-expect("after one write report 9 is read, not the one from the future", mail.read_report("Testmachine")["n"] == 9)
+expect("a report written while the clock ran ahead reads as newest", mail.read_report("Testmachine", files)["n"] == 100)
+mail.write_report("Testmachine", {"n": 9, "updated": mail.now_iso()}, files)
+expect("after one write report 9 is read, not the one from the future", mail.read_report("Testmachine", files)["n"] == 9)
 expect("both future slots now hold report 9", [json.loads((folder / n).read_text())["n"] for n in ["slot-1.json", "slot-3.json"]] == [9, 9])
 expect("no slot keeps a future file time", all((folder / n).stat().st_mtime < time.time() + 60 for n in names))
-mail.write_report("Testmachine", {"n": 10, "updated": mail.now_iso()})
+mail.write_report("Testmachine", {"n": 10, "updated": mail.now_iso()}, files)
 expect("the next report goes into one slot only", [json.loads((folder / n).read_text())["n"] for n in names].count(10) == 1)
 
 # a slot Resilio holds (Windows refuses the rename) is skipped for the next oldest, and nothing is lost
@@ -86,24 +87,24 @@ def refusing(path, data):
         raise PermissionError(13, "held by Resilio", str(path))
     real_write(path, data)
 mail.write_json, real_log, mail.log = refusing, mail.log, lambda machine, text: logged.append(text)
-mail.write_report("Testmachine", {"n": 11, "updated": mail.now_iso()})
-expect("a held slot is skipped: report 11 is read", mail.read_report("Testmachine")["n"] == 11)
+mail.write_report("Testmachine", {"n": 11, "updated": mail.now_iso()}, files)
+expect("a held slot is skipped: report 11 is read", mail.read_report("Testmachine", files)["n"] == 11)
 expect("the held slot is unchanged", json.loads(oldest.read_text())["n"] != 11)
 mail.write_json = lambda path, data: (_ for _ in ()).throw(PermissionError(13, "held", str(path)))
 before = {n: (folder / n).read_text() for n in names}
-expect("with every slot held write_report says so", mail.write_report("Testmachine", {"n": 12, "updated": mail.now_iso()}) is False)
+expect("with every slot held write_report says so", mail.write_report("Testmachine", {"n": 12, "updated": mail.now_iso()}, files) is False)
 expect("... the report is left out and logged, nothing raised",
        len(logged) == 1 and "every slot refused" in logged[0] and before == {n: (folder / n).read_text() for n in names}, logged)
 mail.write_json, mail.log = real_write, real_log
 
 # the one-way-sync check: `seen` stamps come from `updated`, in the UTC stamp form of the old file names
 os.environ["CLAUDE_MAILBOX_MACHINE"] = "Here"
-config = {"machines": ["Here", "Peer", "Quiet"], "hostnames": {}, "stale_minutes": 25}
+config = {"machines": ["Here", "Peer", "Quiet"], "hostnames": {}, "stale_minutes": 25, "reports_via": "files"}
 now = datetime.datetime.now().astimezone()
 def iso(minutes_ago):
     return (now - datetime.timedelta(minutes=minutes_ago)).isoformat(timespec="seconds")
-mail.write_report("Here", {"updated": iso(3)})
-mail.write_report("Here", {"updated": iso(1)})
+mail.write_report("Here", {"updated": iso(3)}, files)
+mail.write_report("Here", {"updated": iso(1)}, files)
 stamps = mail.peer_stamps("Peer", config)
 expect("peer_stamps lists only machines with reports", sorted(stamps) == ["Here"], stamps)
 want = (now - datetime.timedelta(minutes=1)).astimezone(datetime.timezone.utc)
@@ -112,7 +113,7 @@ expect("the old code's report_age reads the stamp", 50 < mail.report_age(stamps[
 def peer(seen, minutes_ago=0):
     for slot in (scratch / "Peer" / mail.REPORTS).glob("*.json") if (scratch / "Peer" / mail.REPORTS).is_dir() else []:
         slot.unlink()
-    mail.write_report("Peer", {"updated": iso(minutes_ago), "seen": {"Here": seen}})
+    mail.write_report("Peer", {"updated": iso(minutes_ago), "seen": {"Here": seen}}, files)
     return mail.dispatcher_warning("Peer", config)
 fresh = mail.peer_stamps("Peer", config)["Here"]
 expect("no warning when the peer saw this machine's newest report", peer(fresh) == "", peer(fresh))
