@@ -4,7 +4,7 @@ processes with a real inbox socket and registry entry, the command-line Claude, 
 
     python3 tests/e2e_v4.py <scratch folder>
 """
-import json, os, shutil, subprocess, sys, time, uuid
+import datetime, json, os, shutil, subprocess, sys, time, uuid
 from pathlib import Path
 
 HERE = Path(__file__).resolve().parent
@@ -338,16 +338,25 @@ try:
     expect("T12 the reply names A's desktop id", "for_session: local_" + A in m12.read_text(), m12.read_text())
     expect("T12 mail to a desktop id reaches the running session", wait_for(delivered_to(m12, A), 30))
 
-    # report
-    reports = sorted((SVC / "mail/Pulvermaar/reports").glob("*.json"))
-    rep = json.loads(reports[-1].read_text())
+    # report: since 2026-11-09 five slot files overwritten in turn, read newest by `updated`, then file time
+    REP = SVC / "mail/Pulvermaar/reports"
+    def latest():
+        def key(path):
+            data = json.loads(path.read_text())
+            try:
+                return (datetime.datetime.fromisoformat(data["updated"]).timestamp(), path.stat().st_mtime)
+            except (KeyError, TypeError, ValueError):
+                return (path.stat().st_mtime, path.stat().st_mtime)
+        return json.loads(max(REP.glob("*.json"), key=key).read_text())
+    newest = lambda: max((p.stat().st_mtime_ns, p.name) for p in REP.glob("*.json"))     # changes with every write
+    reports = sorted(REP.glob("*.json"))
+    rep = latest()
     expect("report lists sessions and desks", any(s["session"] == "local_" + A and s["state"] == "idle" for s in rep["sessions"])
            and "Foo" in rep["desks"] and "Home" in rep["desks"] and "count" in rep["undelivered"], rep)
-    expect("at most five reports kept", len(reports) <= 5)
+    expect("TS1 only slot files, at most five", set(p.name for p in reports) <= {"slot-%d.json" % i for i in range(5)}, reports)
     expect("TA1 the report states its protocol and the peers it sees", rep["protocol"] == 4 and isinstance(rep["seen"], dict)
            and rep["undelivered"]["unseen"] == 0, rep)
     expect("TA2 a log older than log_keep_days was pruned at start", not (HOME / ".claude/claudemail/logs/claudemail.pulvermaar.250101.log").exists())
-    newest = lambda: max(p.name for p in (SVC / "mail/Pulvermaar/reports").glob("*.json"))
     before = newest()
     time.sleep(3)
     expect("TA3 nothing changed, so no new report within report_minutes", newest() == before, before)
@@ -396,12 +405,12 @@ try:
     p = run(["send", "--to", "all", "--subject", "x", "--body-file", body("x")], session=S0, check=False)
     expect("T16 --to all needs --new", p.returncode != 0)
     p = run(["send", "--to", "all", "--new", "--name", "T16", "--subject", "T16 all", "--body-file", body("x")], session=S0)
-    expect("T16 --to all --new reaches every other machine's Home", p.stdout.count("sent ") == 6 and "Pulvermaar/" not in p.stdout, p.stdout)
+    expect("T16 --to all --new reaches every other machine's Home", p.stdout.count("sent ") == len(cfg["machines"]) - 1 and "Pulvermaar/" not in p.stdout, p.stdout)
     ids = [Path(line.split("sent ", 1)[1].strip()).stem for line in p.stdout.splitlines() if line.startswith("sent ")]
     first_sent = Path([line.split("sent ", 1)[1].strip() for line in p.stdout.splitlines() if line.startswith("sent ")][0])
     expect("TC8 a sent message carries protocol: 4", "\nprotocol: 4\n" in first_sent.read_text(), first_sent.read_text()[:400])
     expect("TC1 every recipient of a fan-out gets its own id, a UTC stamp, sender and random part",
-           len(set(ids)) == 6 and all(i[13] == "Z" and "-Pulvermaar-" in i and len(i.split("-")[-1]) == 8 for i in ids), ids)
+           len(set(ids)) == len(cfg["machines"]) - 1 and all(i[13] == "Z" and "-Pulvermaar-" in i and len(i.split("-")[-1]) == 8 for i in ids), ids)
     pair = [subprocess.Popen([PY, "-B", str(SVC / "mail.py"), "send", "--to", "Pulvermaar:Foo", "--for-session", A[:8], "--subject",
                               "TC2 parallel " + str(n), "--body-file", body("x")], env=dict(ENV, CLAUDE_CODE_SESSION_ID=S0),
                              stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True) for n in (1, 2)]
@@ -478,7 +487,6 @@ try:
     settings = HOME / ".claude/settings.json"
     plain = settings.read_bytes()
     settings.write_bytes(b"\xef\xbb\xbf" + plain)
-    latest = lambda: json.loads(max((SVC / "mail/Pulvermaar/reports").glob("*.json")).read_text())
     expect("TA5 an unparsable settings file is in the report", wait_for(lambda: "BOM" in latest()["settings_problem"], 10), latest())
     expect("TA5 and notified once", wait_for(lambda: (HOME / "notified.txt").read_text().count("settings unreadable") == 1, 10))
     settings.write_bytes(plain)
@@ -499,11 +507,32 @@ try:
         "sessions": [], "desks": {"Home": "C:/Users/goocy"}, "undelivered": {"count": 0}}))
     expect("TA6b a peer whose clock runs ahead is named as such", "clock runs 1" in run(["sessions", "Stahlwerk"]).stdout,
            run(["sessions", "Stahlwerk"]).stdout)
-    future = SVC / "mail/Pulvermaar/reports" / (time.strftime("%y%m%d-%H%M%S", time.gmtime(ahead)) + "-000Z.json")
-    future.write_text(json.dumps({"machine": "Pulvermaar", "updated": "x"}))
+    # a slot written while this clock ran ahead (Teppich, 2026-10-30) is overwritten first; a report file of the code
+    # before slots is deleted at the next write, nothing else is (TS2)
+    future = sorted(REP.glob("slot-*.json"))[0]
+    future.write_text(json.dumps({"machine": "Pulvermaar", "updated": time.strftime("%Y-%m-%dT%H:%M:%S", time.localtime(ahead))
+                                  + time.strftime("%z")[:3] + ":" + time.strftime("%z")[3:], "sessions": [], "from": "the future"}))
+    os.utime(future, (ahead, ahead))
+    legacy = REP / "261001-000000-000Z.json"
+    legacy.write_text(json.dumps({"machine": "Pulvermaar", "updated": "2026-10-01T00:00:00-05:00"}))
+    slots_before = sorted(p.name for p in REP.glob("slot-*.json"))
+    expect("TA6c a slot from the future reads as newest until it is overwritten", latest().get("from") == "the future", latest())
+    # Mistral's newest report by `updated` is a slot whose time is not in any file name: `seen` must carry that time
+    mistral_updated = time.time() + 30                       # inside the two minutes a clock may run ahead
+    (SVC / "mail/Mistral/reports/slot-0.json").write_text(json.dumps({
+        "machine": "Mistral", "updated": time.strftime("%Y-%m-%dT%H:%M:%S", time.localtime(mistral_updated)) + time.strftime("%z")[:3] + ":" + time.strftime("%z")[3:],
+        "sessions": [], "desks": {"Home": "C:/Users/goocy"}, "undelivered": {"count": 0}, "protocol": 4, "seen": {}}))
     store("p", BAR, "Report trigger 2")
-    expect("TA6c a report named in the future is pruned, the new one kept", wait_for(lambda: not future.exists(), 10)
-           and latest()["machine"] == "Pulvermaar" and "seen" in latest(), latest())
+    expect("TA6c the future slot is overwritten first, the new report read", wait_for(lambda: future.stat().st_mtime < time.time() + 60, 10)
+           and latest()["machine"] == "Pulvermaar" and "seen" in latest() and "from" not in latest(), latest())
+    expect("TS2 the report file of the code before is deleted", wait_for(lambda: not legacy.exists(), 10))
+    expect("TS2 the slots stay: no slot deleted or added beyond the five",
+           set(slots_before) <= set(p.name for p in REP.glob("*.json")) <= {"slot-%d.json" % i for i in range(5)},
+           sorted(p.name for p in REP.glob("*.json")))
+    expect("TS2 another machine's report files are left alone", (SVC / "mail/Mistral/reports/261026-120000-000.json").exists())
+    seen = latest()["seen"]
+    expect("TS3 `seen` names each peer's newest report by `updated`, as a UTC stamp in the old name form",
+           seen.get("Mistral") == time.strftime("%y%m%d-%H%M%S-000Z", time.gmtime(mistral_updated)), seen)
 
     # a desk of the synced tree starts its sessions in its folder, not in the folder of its newest session, which may
     # be gone (Moosfels' ClaudeMail desk pointed at the removed Steward folder, 2026-10-30)

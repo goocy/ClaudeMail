@@ -221,7 +221,14 @@ def write_atomically(path: Path, text: str) -> None:
     tmp = path.with_name("." + path.name + "." + str(os.getpid()) + ".tmp")
     with open(tmp, "w", encoding="utf-8", newline="\n") as fh:
         fh.write(text)
-    move(tmp, path)
+    try:
+        move(tmp, path)
+    except OSError:
+        try:
+            tmp.unlink()
+        except OSError:
+            pass
+        raise
 
 
 def move(source: Path, target: Path) -> None:
@@ -631,37 +638,100 @@ def session_listing(config: dict) -> tuple:
     return sessions, desks
 
 
-def report_names(machine: str) -> list:
-    """A machine's report files, newest first. Since 2026-10-27 the names are UTC stamps ending in Z, which never go
-    back; a name without the Z is a local-time stamp from before and counts as older than any UTC one, because local
-    names sorted a report written after the clock went back (a time zone change, the DST fall-back) as the oldest, and
-    the writer deleted it at once (Pulvermaar, 2026-10-26)."""
+REPORT_SLOTS = 5
+CLOCK_AHEAD_SECONDS = 120
+
+
+def report_slots(machine: str) -> list:
+    """A machine's fixed report files, slot-0.json to slot-4.json. Since 2026-11-09 each report overwrites the oldest
+    slot instead of being a new <stamp>.json with the oldest deleted: every deletion left a deleted-file record that all
+    Resilio peers keep and walk for good (some 80,000 from the reports of ClaudeMail, LeaseResources and the supervisors;
+    Pektolith's sync stalled for 12 days in October). With five slots a file changes only every few report intervals,
+    so no peer is still fetching it when it changes, which is what caused the conflicts of 2026-09-28."""
+    return [machine_dir(machine) / REPORTS / ("slot-%d.json" % i) for i in range(REPORT_SLOTS)]
+
+
+def file_time(path: Path) -> float:
+    """A file's modification time; -inf for one that is not there (an empty slot is used first)."""
+    try:
+        return path.stat().st_mtime
+    except OSError:
+        return float("-inf")
+
+
+def report_entries(machine: str) -> list:
+    """[(path, report)] of a machine's reports that parse, newest first: by the `updated` time written inside (ISO with
+    its offset, so a time zone change or the DST fall-back does not reorder them), then by file time; never by name.
+    The <stamp>.json files of the code before slots are read the same way until their machine deletes them."""
     folder = machine_dir(machine) / REPORTS
     if not folder.is_dir():
         return []
-    return sorted((p for p in folder.glob("*.json") if not p.name.startswith(".")),
-                  key=lambda p: (p.stem.endswith("Z"), p.name), reverse=True)
+    entries = []
+    for path in folder.glob("*.json"):
+        if path.name.startswith("."):
+            continue
+        mtime = file_time(path)
+        try:
+            report = read_json(path)
+        except (OSError, ValueError, AssertionError):    # gone since the listing, or not a JSON object
+            continue
+        try:
+            written = datetime.datetime.fromisoformat(str(report.get("updated"))).timestamp()
+        except (TypeError, ValueError, OverflowError, OSError):
+            written = mtime
+        entries.append((written, mtime, path, report))
+    entries.sort(key=lambda e: (e[0], e[1]), reverse=True)
+    return [(path, report) for _, _, path, report in entries]
+
+
+def report_names(machine: str) -> list:
+    """A machine's report files that parse, newest first (report_entries)."""
+    return [path for path, _ in report_entries(machine)]
 
 
 def read_report(machine: str) -> dict:
-    """The newest report of a machine; {} when it has none. Resilio writes each file under a temp name and renames it,
-    so a listed report is complete."""
-    names = report_names(machine)
-    return read_json(names[0]) if names else {}
+    """The newest report of a machine; {} when it has none. Every report is written under a temp name and renamed, so a
+    listed one is complete."""
+    entries = report_entries(machine)
+    return entries[0][1] if entries else {}
 
 
-def write_report(machine: str, report: dict) -> None:
-    """A new file per report, then all but the newest five go: a rewritten file kept causing Resilio conflicts, and
-    with only two kept a reader on Mistral briefly found none (Resilio delivered the deletions first, 2026-09-28)."""
-    stamp = datetime.datetime.now(datetime.timezone.utc)
-    path = machine_dir(machine) / REPORTS / (stamp.strftime("%y%m%d-%H%M%S-") + "%03dZ.json" % (stamp.microsecond // 1000))
-    write_json(path, report)
-    # A name from a clock that ran ahead (Teppich, 2026-10-30: three hours) would sort above every new report for as long
-    # and be read instead; once this clock is right, such names go, and the report just written is always kept.
-    kept = [p for p in report_names(machine) if p != path and report_age(p.stem) > -120][:4]
-    for old in report_names(machine):
-        if old != path and old not in kept:
-            old.unlink()
+def report_time() -> str:
+    """`updated` of a report: local time with its offset, to the millisecond, so that two reports of one second (a
+    pass and a crash report) are told apart by what they say, not by file times that Resilio may round on a peer."""
+    return datetime.datetime.now().astimezone().isoformat(timespec="milliseconds")
+
+
+def write_report(machine: str, report: dict) -> bool:
+    """Overwrites the oldest of the five slots (report_slots says why) through a temp name and a rename, then deletes
+    any other report file there, the <stamp>.json of the code before; after that nothing is ever deleted. Slots with a
+    file time more than CLOCK_AHEAD_SECONDS in the future were written while this clock ran ahead (Teppich, 2026-10-30:
+    three hours); readers would take them as newest for as long, so the report goes into all of them at once. A slot
+    Resilio holds past write_json's retries (Windows) is skipped for the next oldest; with none writable the report is
+    left out and logged, and False tells the dispatcher to try again on its next pass."""
+    now = time.time()
+    slots = sorted(report_slots(machine), key=file_time)            # oldest first; an empty slot before any other
+    ahead = [p for p in slots if file_time(p) > now + CLOCK_AHEAD_SECONDS]
+    written, failed = [], []
+    for path in (ahead or slots):
+        try:
+            write_json(path, report)
+            written.append(path)
+        except OSError as exc:
+            failed.append(path.name + ": " + str(exc))
+            continue
+        if not ahead:
+            break
+    if not written:
+        log(machine, "report not written, every slot refused: " + "; ".join(failed))
+        return False
+    for old in (machine_dir(machine) / REPORTS).glob("*.json"):
+        if not old.name.startswith(".") and old not in report_slots(machine):
+            try:
+                old.unlink()
+            except OSError:
+                pass
+    return True
 
 
 def machine_view(machine: str, config: dict) -> dict:
@@ -689,8 +759,9 @@ def crash_line(crash: dict) -> str:
 
 
 def report_age(name: str) -> float:
-    """Seconds since a report was written, from its name (a UTC stamp ending in Z); a local-time name is from before
-    2026-10-27 and counts as older than anything."""
+    """Seconds since a report was written, from the stamp a peer lists in `seen` (a UTC stamp ending in Z: report_stamp,
+    or a report's file name before slots); a local-time name is from before 2026-10-27 and counts as older than
+    anything."""
     if not name.endswith("Z"):
         return float("inf")
     stamp = datetime.datetime.strptime(name[:13], "%y%m%d-%H%M%S").replace(tzinfo=datetime.timezone.utc)
@@ -719,8 +790,10 @@ def dispatcher_warning(machine: str, config: dict) -> str:
     if "seen" in report:
         # How old this machine's newest report was, as that machine saw it when it wrote its own: not what Resilio's
         # delay to here adds. "" (never seen) counts as older than anything.
+        # Since 2026-11-09 the stamps come from the `updated` inside the reports (report_stamp); a peer still on the
+        # code before slots names a slot file here instead, which says nothing about time and is not judged.
         theirs = report["seen"][here] if here in report["seen"] else ""
-        if report_age(theirs) - report_age(report_names(machine)[0].stem) > limit:
+        if not theirs.startswith("slot-") and report_age(theirs) - age(report["updated"]) > limit:
             return (machine + " has not seen this machine's reports since " + (theirs or "ever")
                     + ": the sync between the two is one-way, and replies may not arrive")
     return ""
@@ -1339,9 +1412,24 @@ def prune_logs(machine: str, config: dict) -> None:
             path.unlink()
 
 
+def report_stamp(path: Path, report: dict) -> str:
+    """When a report was written, as the UTC stamp its file name was before slots (yymmdd-HHMMSS-mmmZ), from its
+    `updated`, else its file time: peers' dispatcher_warning, on this code and the code before, parse that form."""
+    try:
+        when = datetime.datetime.fromisoformat(str(report.get("updated"))).astimezone(datetime.timezone.utc)
+    except (TypeError, ValueError, OverflowError, OSError):
+        try:
+            when = datetime.datetime.fromtimestamp(path.stat().st_mtime, datetime.timezone.utc)
+        except (OSError, OverflowError, ValueError):          # gone since it was read (Resilio): never seen, as before
+            return ""
+    return when.strftime("%y%m%d-%H%M%S-") + "%03dZ" % (when.microsecond // 1000)
+
+
 def peer_stamps(machine: str, config: dict) -> dict:
     """The newest report this machine sees from every other one, so that any machine can tell a one-way sync."""
-    return {m: names[0].stem for m in config["machines"] if m != machine for names in [report_names(m)] if names}
+    stamps = {m: report_stamp(*entries[0]) for m in config["machines"] if m != machine
+              for entries in [report_entries(m)] if entries}
+    return {m: stamp for m, stamp in stamps.items() if stamp}
 
 
 def record_crash(machine: str, version: str, error: Exception, config: dict) -> None:
@@ -1365,7 +1453,7 @@ def record_crash(machine: str, version: str, error: Exception, config: dict) -> 
     if ("crash" not in newest or newest["crash"]["signature"] != signature
             or age(newest["updated"]) > 60 * float(config["report_minutes"])):
         write_report(machine, dict(newest, machine=machine, pid=os.getpid(), version=version, protocol=PROTOCOL,
-                                   crash=crash, updated=now_iso()))
+                                   crash=crash, updated=report_time()))
 
 
 def local_heartbeat() -> Path:
@@ -1535,12 +1623,15 @@ def dispatch_loop(machine: str, version: str) -> None:
                    "new_code_does_not_compile": new_code}
         key = json.dumps([sorted([s["session"], s["desk"], s["title"], s["state"] == "closed"] for s in sessions),
                           sorted(desks.items()), listing["undelivered"], settings, new_code], sort_keys=True)
+        published = True
         if key != last_key or time.time() - last_report > 60 * float(config["report_minutes"]):
-            write_report(machine, dict(listing, machine=machine, pid=os.getpid(), version=version, protocol=PROTOCOL,
-                                       seen=peer_stamps(machine, config), updated=now_iso()))
-            last_key, last_report = key, time.time()
+            published = write_report(machine, dict(listing, machine=machine, pid=os.getpid(), version=version,
+                                                   protocol=PROTOCOL, seen=peer_stamps(machine, config),
+                                                   updated=report_time()))
+            if published:                                    # else tried again on the next pass
+                last_key, last_report = key, time.time()
         crash = LOCAL_DIR / CRASH_FILE
-        if crash.is_file():                                  # a whole pass, report included, went through
+        if crash.is_file() and published:                    # a whole pass, report included, went through
             log(machine, "dispatcher recovered: a pass completed after " + crash_line(read_json(crash)))
             crash.unlink()
         if time.time() - last_beat > 60 * float(config["heartbeat_minutes"]):
