@@ -1026,8 +1026,9 @@ def cmd_inbox(args, config: dict) -> None:
 # ---------------------------------------------------------------- delivery
 
 def delivery_text(machine: str, desk: str, path: Path, text: str, config: dict, meant_for: str, opened: bool,
-                  meant_account: str) -> str:
-    """What the session is given: who it is from, what to do with it, how to answer, and the message."""
+                  meant_account: str, *, source: Path) -> str:
+    """What the session is given: who it is from, what to do with it, how to answer, and the message. `path` is where the
+    session will find the message (read/); `source` is where it lies now, before the claim, which a signature check reads."""
     header, body = parse_message(text)
     parts = ["ClaudeMail: a message for this session (" + machine + ":" + desk + ")."
              + (" ClaudeMail opened this session for it." if opened else "")]
@@ -1051,7 +1052,7 @@ def delivery_text(machine: str, desk: str, path: Path, text: str, config: dict, 
     ]
     import signed_mail
     signed_mail.start_delivery()
-    block = signed_mail.signed_block(path, text, desk)
+    block = signed_mail.signed_block(path, text, desk, source=source)
     if block is None:
         limit = int(config["inject_max_chars"])
         shown = body if len(body) <= limit else body[:limit] + "\n[... truncated; full text in " + display(path) + "]"
@@ -1279,7 +1280,7 @@ def deliver(machine: str, desk: str, message: Path, config: dict, running: dict,
         claimed = message.parent / READ / message.name
         payload = inbox_payload(entry, delivery_text(machine, desk, claimed, message.read_text(encoding="utf-8"), config,
                                                      status.get("meant_for", ""), "opened" in status,
-                                                     status.get("meant_account", "")))
+                                                     status.get("meant_account", ""), source=message))
         claimed.parent.mkdir(exist_ok=True)
         move(message, claimed)                               # the claim: delivered at most once, even by two dispatchers
         try:
