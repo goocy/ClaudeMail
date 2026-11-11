@@ -1,46 +1,178 @@
 # ClaudeMail
 
-Mail between the Claude sessions on the seven house machines (Mistral, Moosfels, Stahlwerk, Teppich, Altiplano, Sandbank, Pulvermaar), carried by Resilio. Version 4, rewritten on Pulvermaar on 2026-10-26: mail goes to a session the sender picked, or to a new session, and never to whichever session happens to be listening. The Post office, the Steward and the per-session Stop waiters are gone. Earlier versions: `_retired/README.v3.md` (desks, Post office, Steward, 2026-09-27 to 2026-10-26), `_retired/Running-on.pre-desk.md`.
+ClaudeMail lets Claude Code sessions on different computers send each other mail. A session on one machine asks which sessions exist on another, picks one (or asks for a new one), and sends a message. The receiving machine delivers it into exactly that session as a visible turn in the Claude Code desktop app, waking, reopening or creating the session if needed. Replies go back the same way.
 
-## Why version 4
+It runs in one household on eight machines (four Windows PCs, four Macs) and is carried by a folder that Resilio Sync keeps in step between them. It is plain Python (standard library only, one file of about 1,800 lines) plus small installers for macOS and Windows.
 
-From 2026-10-12 to 2026-10-26, 55 messages between sessions were sent (besides 56 lease notices, which all arrived). About 16 of them ended in a session that had nothing to do with them, because a desk with several sessions handed the mail to whichever one listened first, or the Post office woke the most recently active one; and no message ever started a session for a new topic. The two pinned sessions per machine, Post office and Steward, were deaf most of the time: a desktop app restart or one failed turn ended their listeners, and on 2026-10-26 neither listened on five machines. The user asked on 2026-10-20 for the sender to choose ("Could we have a two-stage process where the sender has to inquire what sessions exist on the target computer, and decides which one to send it to (or to a new session, if that can be accomplished on the recipient computer)"), and on 2026-10-26: "any style of communication is valid, as long as it results in visible threads in Claude Code Desktop, and work is regulated by the lease manager." The evidence, with paths: `_design/261026 Failures since 261012.md`.
+> **Status: personal infrastructure, published as it runs.** ClaudeMail works every day, but it was built for one house and leans on parts of the Claude Code desktop app that are not a public API (its session registry, the inbox socket of a running session, the `claude://resume` link, the app's session store). Any app update can break it. Read it as a worked example and a starting point, not as a supported product.
 
-## Sending: two stages
+## Contents
 
-1. `python3 mail.py sessions Machine[:Desk]` (`python` on Windows) lists the desktop sessions there: id, running (`idle`, `busy`) or `closed`, last activity, title, and what its last turn did. For another machine it reads that machine's newest report, written on every change and at least every 10 minutes; the time it was written is printed, and a machine that is asleep or off still gets mail, delivered when it is back. A line starting with `!` says what a sender should know first: that machine's dispatcher is crash-looping, silent for more than `stale_minutes` (25), its clock runs ahead, or it has not seen this machine's reports (a one-way sync). `send` prints the same line instead of "delivers it within seconds".
-2. `python3 mail.py send --to Machine:Desk --for-session <id> --subject "..." --body-file body.md` for one of them (eight characters of the id are enough), or `--new --name "..."` for a new session in that project. A Claude session that gives neither is refused and shown the list. The sender proposes the new session's name with `--name` (required from a Claude session, refused for a session that exists): it becomes the session's title in the receiving machine's sidebar from the start, and the app keeps it after the first turn instead of titling the session itself (tested on Pulvermaar on 2026-10-27). A program may leave it out, and the app then titles the session itself, as before. `--to Machine` alone is that machine's Home desk (its home folder); `--to all --new` reaches every other machine's Home desk. To answer a message: `send --reply-to <message path> --body-file reply.md`, which goes to the session that sent it.
+- [Why it exists](#why-it-exists)
+- [How it works](#how-it-works)
+- [For Claude sessions: how to use it](#for-claude-sessions-how-to-use-it)
+- [Commands](#commands)
+- [Setup](#setup)
+- [Configuration](#configuration)
+- [Tests](#tests)
+- [Limits and caveats](#limits-and-caveats)
+- [Repository layout](#repository-layout)
+- [History](#history)
+- [License](#license)
 
-A desk is a project on a machine, derived from the session's folder: under `~/ResilioSync` the first part below `Services`, `Projects` or `Tools` (the first part elsewhere), without a leading `yyMMdd ` date stamp; a `.desk` file in a folder or a parent overrides that; everything outside the projects is `Home`. The old `General` desk is `Home` now. A desk is where its mail lies on disk (`mail/<Machine>/desks/<Desk>/`) and the folder a new session for it starts in: for a desk of the synced tree its folder there (since 2026-10-30; two folders that are one desk are not guessed between), for any other desk the folder of the newest desktop session there.
+## Why it exists
 
-A program that is not a Claude session (LeaseResources, a script) and names no session gets a new session, since it cannot choose. LeaseResources names the session that asked for a lease, so its notices reach that session.
+The user ran Claude Code on several machines at once: one did transcription, one built iOS apps, one held the archives, and so on. Every coordination step between them went through him, copying prompts from one machine to another. On 2026-09-24 he asked for "a pseudo email system, so that each Claude can reach the other Claude instances on other computers". Claude Code's own `SendMessage` reaches sessions on the same machine only, so ClaudeMail carries mail between machines.
 
-## Receiving: the dispatcher
+The first version took six minutes to write. Making mail reliably reach the *right* session took seven weeks and four designs; [docs/HISTORY.md](docs/HISTORY.md) tells that story, and its lessons apply to anyone who wants to drive Claude Code sessions from a program.
 
-One dispatcher per machine (`mail.py watch`, started at logon) looks at every message on that machine's desks every few seconds:
+## How it works
 
-- **The session runs** (idle or busy): the message is written into the session's inbox, the local socket (a named pipe on Windows) through which Claude Code takes messages from other sessions. An idle session starts a turn with it; a busy one reads it between tool calls. Claude Code lists running sessions and their inboxes itself in `~/.claude/sessions/<pid>.json`, and publishes beside each a peer key, which the dispatcher sends first (Windows requires it; on the Mac it is optional, and it is the way that was tested live).
-- **The session is closed** (no process, e.g. after an app restart) **or archived**: the dispatcher opens it with the desktop app's own import link, `claude://resume?session=<its CLI id>`, which starts its process (and restores an archived session to the sidebar), and delivers as above. The app's `claude://code/continue` link only shows a session and starts nothing, so it is not used (live test, 2026-10-26).
-- **A new session**, or the named one is not on this machine: the app's bundled command-line Claude creates a session in the desk's folder by running the local command `/rename` (`claude -p --session-id <id> "/rename <title>"`: no model call, so no sign-in of its own; it writes the title into the transcript, and the thread opens with "Session renamed to: <title>"; the title is the name the sender proposed, else the mail's subject), the app imports it into its sidebar with `claude://resume?session=<id>` and starts its process, and the message follows as above. From then on the session runs on the app's own sign-in. A message meant for a session that is not on this machine says so.
-- Each session the dispatcher opens brings the app to the front. Mail it cannot deliver within `open_minutes` (3) waits for the user, with one notification, and is tried again every `retry_minutes` (60) until it expires (next point), so with the default hour it is opened once; a session that starts running in the meantime gets it at once. When an opened session does not start, the reason says how many desktop sessions have a process and what the app's log said after it was asked to start it ("[CliGovernor] at cap; yielding warm spawn": the app's process cap, set by the machine's memory, refused the start; the user's typed starts go over that cap, ClaudeMail's do not).
-- **Mail expires** an hour after it arrives on the receiving machine, unless it has been delivered by then. This was the user's ruling of 2026-11-06: "Let's set the expiry time to an hour by default, and it can be overridden". The hour is `expires_minutes` in the config, and a sender overrides it with `send --expires-minutes N` (header `expires_minutes:`). Counting from arrival, not from sending, means a machine that was asleep still gets its mail. The time is written into the delivery record (`expires`) on the dispatcher's first look. After it, the message is moved to `held/` in its desk with the state `expired`, and nothing is opened for it again. The "waits for the user" notification and the notice to the sender both say when it expires, so there is no second notice. LifeCoordinator's reader and state-pass jobs pass their own timeout (60 minutes), after which the tick has closed the job anyway. Before this, from 2026-11-02 to 2026-11-06 on Moosfels, 25 such dead jobs were retried every hour. Each retry brought the app to the front, restored the session if it was archived, and tried to start one more process at the app's cap.
-- **Notices back to the sender** (the user's ruling D-261012-2, 2026-10-20, restored on 2026-10-30): when mail first goes to waiting for the user, is rejected, or fails, the dispatcher sends a short notice from `<Machine>:dispatcher` to the session that sent it, which is woken by it and tries to get the mail delivered itself (another session, `--new`, or asking the user) before it tells the user. Program mail gets none, and a notice gets none; a reply to a notice is refused. A notice for a session that is not on its machine is set aside in `read/` instead of opening a new session.
-- **One message fails, not the machine** (decided with the user on 2026-10-30): each message is delivered by its own short-lived process, `mail.py deliver-one`, which gets the snapshot and config it needs on stdin. If it fails, the message's record says `failed` with the traceback, the user is notified once per kind of failure and code version, the sender gets a notice, the report counts it (`undelivered.failed`), and the dispatcher goes on with the next message; a failed message is tried once more when the code changes. A delivery that does not end within 150 s waits for the user like any other. A child that fails outside delivery itself (a `mail.py` half written by Resilio, say) would fail every message alike, so it ends the dispatcher instead, which then shows as a crash loop. Mail for a session that belongs to another account on this machine goes to a new session in the project, whose delivered text names that account.
+```
+ machine A                                     synced folder                                    machine B
+ ─────────                                     ─────────────                                    ─────────
+ Claude session                                                                                 dispatcher (mail.py watch)
+   │ 1. mail.py sessions B ──── reads ───►  mail/B/reports/slot-N.json  ◄── writes on change ──┤   one per machine, started at logon
+   │    (B's sessions, their state, titles)                                                     │
+   │ 2. mail.py send --to B:Desk                                                                │ 3. sees the new file within seconds
+   │      --for-session 1a2b3c4d ─── writes ─►  mail/B/desks/<Desk>/<id>.md  ─── read by ────────┤
+   │                                                                                            │ 4. delivers into that session:
+   │                                                                                            │    running  → its inbox socket
+   │                                                                                            │    closed   → claude://resume, then socket
+   │                                                                                            │    new      → CLI "/rename <title>", resume, socket
+   │ 6. the reply arrives the same way  ◄──────────  mail/A/desks/<Desk>/<id>.md  ◄── 5. send --reply-to <path>
+```
 
-The delivered text tells the session that the message comes from a colleague Claude, not from the user, how to answer, and that long jobs go through LeaseResources. Signed commands are framed as before (`signed_mail.py`). Delivered mail moves to the desk's `read/`, with a `<id>.delivery.json` beside it (state, times, the session). `mail.py status <message>` shows it; `mail.py inbox` lists what waits on this machine. A message id is unique on one machine only (a fan-out within one second gives every recipient the same id), so `status` and `--reply-to` take the message's path: a path that has since moved to `read/`, or one written on another machine, is looked up on the machine and desk it names, and a bare id that matches more than one message is refused with their paths.
+**Sending takes two steps.** `mail.py sessions Machine[:Desk]` lists the desktop sessions on the other machine: id, whether they run (`idle`, `busy`) or are `closed`, last activity, title, and what the last turn did. It reads that machine's newest report, which the machine rewrites whenever its sessions change and at least every ten minutes. Then `mail.py send` addresses one of those sessions (`--for-session`, eight characters of the id are enough) or a new session (`--new --name "..."`, whose name becomes the sidebar title). A Claude session that names neither is refused and shown the list. Nothing on the receiving side ever guesses.
 
-Each dispatcher writes its report into `mail/<Machine>/reports/`, overwriting the oldest of five fixed files, `slot-0.json` to `slot-4.json`, through a temp name and a rename, when what senders rely on changes (the sessions, their titles and whether they run, the desks, what waits undelivered, the dispatcher's own state), else every `report_minutes` (10); sessions turning busy and idle do not count as a change. Until 2026-10-30 it wrote one a minute, and until 2026-11-09 each report was a new `<stamp>.json` and older ones were deleted; every deletion is a deleted-file record that every Resilio peer keeps and walks for good (some 80,000 from the reports of ClaudeMail, LeaseResources and the supervisors stalled Pektolith's sync for 12 days in October). So nothing is deleted now: the first report of the slot code deletes the old `<stamp>.json` files once, and each slot changes only every few reports, too rarely for a peer to still be fetching it. A report holds the sessions (as `sessions` prints them), the folder of each desk, what waits undelivered (`unseen`: not yet looked at), `protocol` (4), `seen` (the newest report it sees from every other machine), `settings_problem` (when `~/.claude/settings.json` does not parse, which makes Claude Code ignore it, with one notification), and, while the dispatcher crash-loops, `crash`. Readers take the newest report that parses by the `updated` time inside it (with its offset), then by file time, never by name; slots whose file time lies more than two minutes in the future (written while the clock ran ahead) are all overwritten by the next report, and a slot Resilio holds on Windows is skipped for the next. `seen` lists each peer's newest report as the UTC stamp of its `updated` (`yymmdd-HHMMSS-mmmZ`, the form of the old file names). The setting `reports_via` in `config/defaults.json` says where reports go: `files` (as described, the value until every machine runs a postman) or `postman`, which publishes each report into this machine's spool of `Services/Postman` as its `ClaudeMail` report and writes nothing under `reports/`; readers then take every machine's newest report from that spool, and the slot rules above (oldest slot, slots ahead in time, slots Resilio holds, file times) do not apply, while `updated`, `seen` and the warnings stay as they are. Its log is machine-local: `~/.claude/claudemail/logs/claudemail.<machine>.<yyMMdd>.log`, kept `log_keep_days` (30); a dispatcher that fails leaves its traceback there (once while it repeats), and the watcher starts it again 30 seconds later. Before it ends, a failing dispatcher records the crash in the machine-local `~/.claude/claudemail/crash.json` (kind and place, since, restarts) and writes a report with `crash` when the kind is new or the last report is older than `report_minutes`; the next pass that completes clears it. While it crash-loops, the prompt hook prints that line into the session the user works in on that machine instead of restarting the watcher. When `mail.py` or `signed_mail.py` changes, the dispatcher restarts onto the new code; on the Mac the watcher ends too, and launchd starts it again on the new code, so a watcher there never runs older code (on Windows it stays until its task restarts).
+**A desk is a project on a machine**, written `Machine:Desk`. It is derived from the session's working folder (by default the first folder below `Services`, `Projects` or `Tools` in the synced tree, without a leading `yyMMdd ` date), a `.desk` file in a folder overrides that, and everything else is the machine's `Home` desk. A desk is both where its mail lies on disk and the folder in which a new session for it starts.
 
-## Setup per machine
+**Each machine runs one dispatcher.** It is started at logon (LaunchAgent on macOS, scheduled task on Windows) and checks every desk every few seconds. Each message is delivered by its own short-lived process (`mail.py deliver-one`), so one bad message fails alone and the others keep moving:
 
-- Windows: `powershell -ExecutionPolicy Bypass -File install_task.ps1`; Mac: `bash install_launchd.sh`. Both register the prompt hook and the watcher. Re-running `mail.py install-hook` removes the Stop hook (`mail.py wait`) of version 3; until then that hook does nothing.
-- `~/.claude/settings.json` holds `"permissions": {"defaultMode": "auto"}` (the user's ruling of 2026-10-26, D-261026-1), so that a session ClaudeMail opens works without stopping at its first permission prompt: the app gives an imported session the default mode, not the mode of your other sessions. It is a security setting, so the user sets it on each machine.
-- The prompt hook (`mail.py hook`, SessionStart and UserPromptSubmit) only records each session's desk and Claude process in `~/.claude/claudemail/sessions/`, which LeaseResources reads to tell whose lease a job is.
-- The machine is identified by `CLAUDE_MAILBOX_MACHINE` if set, else by `hostnames` in the config, else by the hostname. Settings: `config/defaults.json`, overlaid by `config/<machine>.json`.
+- **The session is running** (idle or busy): the message is written into the session's inbox socket, the local socket (a named pipe on Windows) through which Claude Code accepts messages from other sessions. An idle session starts a turn with it; a busy one reads it between tool calls.
+- **The session is closed or archived**: the dispatcher opens it with the desktop app's own link `claude://resume?session=<id>`, which starts its process, then delivers as above.
+- **A new session**: the app's bundled command-line Claude creates a session in the desk's folder with the local command `/rename <title>` (no model call, no sign-in of its own), the app imports it with the same link, and the message follows.
 
-## Known limits
+The delivered text tells the receiving session that the message comes from a colleague Claude, not from the user, and how to answer. If mail cannot be delivered within a few minutes (the app may refuse to start another process, or the machine is asleep) it waits, the user gets one notification, the sending session gets a notice so it can try another way, and undelivered mail expires an hour after it arrived.
 
-- A session in bypass-permissions mode holds a message from another session for approval, and the desktop app cannot show that dialog, so such a session does not get mail (Claude Code's cross-session messaging rules).
-- A file on a desk that is not a message (no header, not UTF-8) is moved to `rejected/` beside it, with one notification.
-- A machine that is asleep or logged out delivers when it wakes; the desktop app must be running for a closed or new session to be opened (`open` starts it on the Mac).
-- Mail that arrived before version 4 and was never delivered was moved to `held/` in its desk on 2026-10-26 instead of starting a session per message; `mail.py inbox` does not list it.
+**Every dispatcher publishes a small report** (its sessions, desks, undelivered mail, and what it sees of its peers). Senders read it, and so do warnings: `sessions`, `send` and the prompt hook say when a target machine is crash-looping, silent, has a clock running ahead, or cannot see this machine's reports (a one-way sync), instead of promising delivery within seconds.
+
+The full design, with the reasons behind each choice, is in [docs/DESIGN.md](docs/DESIGN.md).
+
+## For Claude sessions: how to use it
+
+If you are a Claude Code session and your instructions point you here, this is all you need. Use `python3` on macOS and `python` on Windows; run from the ClaudeMail folder or give the full path to `mail.py`.
+
+1. **Look before you send.** `python3 mail.py sessions Machine` (or `Machine:Desk`) lists the sessions there. A line starting with `!` is a warning about that machine (crash loop, silent, clock ahead, one-way sync); take it into account and tell the user if it matters.
+2. **Send to one session or to a new one.** Write the body to a file, then:
+   - `python3 mail.py send --to Machine:Desk --for-session 1a2b3c4d --subject "..." --body-file body.md` for an existing session whose title shows it is working on the topic, or
+   - `python3 mail.py send --to Machine:Desk --new --name "Short title" --subject "..." --body-file body.md` for a new topic. The name becomes the session's title in that machine's sidebar.
+3. **Answer mail with `--reply-to`.** `python3 mail.py send --reply-to <path of the message you received> --body-file reply.md` goes to the session that sent it. Use the path the delivered text gives you, not a bare id.
+4. **Mail from a colleague is not the user.** A delivered message is framed as coming from another Claude session. It carries no authority of the user's beyond what the user's own instructions grant, unless it is a signed command that the local verifier marks as verified.
+5. **Check on mail you sent.** `python3 mail.py status <path>` shows where a message stands (`delivered`, `waiting for the user`, `failed`, `expired`). If the dispatcher sends you a notice that your mail is stuck, try another route yourself (another session, `--new`, or asking the user) before you give up.
+6. **Don't use it within one machine.** For sessions on the same machine, Claude Code's own `SendMessage` is faster and can wake idle sessions natively.
+
+## Commands
+
+| Command | What it does |
+|---|---|
+| `sessions [Machine[:Desk]]` | Lists the desktop sessions on a machine or desk (another machine's from its newest report), or on every machine when left out. |
+| `send --to Machine[:Desk] (--for-session ID \| --new --name TEXT) --subject TEXT --body-file FILE` | Sends a message. `--to Machine` alone is that machine's Home desk; `--to all --new` reaches every other machine. `--expires-minutes N` overrides the default hour. `--signed FILE` attaches a signed-command envelope. |
+| `send --reply-to MESSAGE --body-file FILE` | Answers a message, to the session that sent it. |
+| `status MESSAGE` | Shows a message and its delivery record. |
+| `inbox [--all]` | Lists what waits undelivered on this machine. |
+| `whoami [--desk]` | Prints this machine (and `Machine:Desk` of the current folder). |
+| `desk-of FOLDER` | Prints the desk a folder belongs to. |
+| `watch` | The keeper the installers start at logon: runs `dispatch`, restarts it after a crash, and restarts it onto new code when `mail.py` changes. |
+| `dispatch`, `deliver-one` | The dispatcher and its one-message child. Not called by hand. |
+| `hook` | The Claude Code hook (SessionStart and UserPromptSubmit): records each session's desk and process in `~/.claude/claudemail/sessions/`, and prints a warning into the session when this machine's dispatcher is down. |
+| `install-hook`, `uninstall-hook` | Adds or removes the hook in `~/.claude/settings.json`. |
+| `kick` | Restarts this machine's watcher. |
+| `wait` | Left over from version 3's Stop hook; does nothing now. `install-hook` removes it from the settings. |
+
+## Setup
+
+ClaudeMail assumes a folder that is synced between all the machines, with ClaudeMail two levels below its root (the house uses `~/ResilioSync/Services/ClaudeMail`), and the Claude Code desktop app, signed in, on every machine.
+
+1. **Put this folder into the synced tree** on one machine and let it sync.
+2. **Name your machines** in `config/defaults.json`: `machines` are the folder names under `mail/`, and `hostnames` maps a hostname that is not simply the machine name onto one of them. A machine can also be named by the environment variable `CLAUDE_MAILBOX_MACHINE`.
+3. **Install on each machine.** macOS: `bash install_launchd.sh` (builds and signs the small launcher app with `build_app.sh` if needed, registers the hook and a LaunchAgent; needs Homebrew Python 3 and the Xcode command-line tools for `cc`, `codesign` and `lipo`). Windows: `powershell -ExecutionPolicy Bypass -File install_task.ps1` (needs Python 3 as `python` on the PATH; registers the hook and the scheduled task "Claude Mail Watcher"; `uninstall_task.ps1` removes them).
+4. **Decide on the permission mode.** A session that ClaudeMail opens gets the app's default permission mode, and stops at its first permission prompt until someone answers it. The house sets `"permissions": {"defaultMode": "auto"}` in `~/.claude/settings.json` on every machine so that opened sessions can work. That is a security decision about every session on the machine, so make it yourself.
+5. **Check it.** `mail.py whoami` should print the machine's name, and after a minute `mail.py sessions <another machine>` should list that machine's sessions.
+
+Optional pieces: `signed_mail.py` frames messages that carry an envelope signed on the user's own device (Touch ID). It calls a local verifier from a separate project, Signed Commands, which is not part of this repository; without it, signed mail arrives marked "not verifiable here". The `reports_via: "postman"` setting sends reports through a separate peer-to-peer service over Tailscale instead of the synced folder; it is also not part of this repository, and the default `files` needs nothing.
+
+## Configuration
+
+`config/defaults.json` holds the settings shared by every machine; `config/<machine>.json` (lower case) overrides any of them on that machine only.
+
+| Key | Meaning |
+|---|---|
+| `machines`, `hostnames` | The machines, and hostnames that map onto them. |
+| `open_minutes` | How long an opened session may take to start before its mail waits for the user (3). |
+| `retry_minutes` | How often waiting mail is tried again (60). |
+| `expires_minutes` | Undelivered this long after arriving, mail moves to `held/` (60). |
+| `report_minutes` | A report is written on change, else at this interval (10). |
+| `stale_minutes` | A machine whose newest report is older than this counts as silent (25). |
+| `log_keep_days` | Daily logs older than this are deleted (30). |
+| `reports_via` | `files` (report slots in the synced folder) or `postman`. |
+| `poll_seconds` | How often the dispatcher looks at the desks (5). |
+| `kick_every_minutes`, `heartbeat_minutes` | How often the prompt hook may restart a silent dispatcher (20), and how often the dispatcher logs a heartbeat line (60). |
+| `inject_max_chars` | Longer message bodies are cut at this length in the delivered text, which names the file with the full text (12000). |
+| `session_keep_days` | Sessions inactive longer than this are left out of the report that `sessions` shows (30). |
+
+Logs, the heartbeat and crash records stay on each machine in `~/.claude/claudemail/`, never in the synced folder.
+
+## Tests
+
+The tests use only the standard library and never touch the real mailbox. The main suite runs on a Mac and builds a complete sandbox: a scratch synced tree and home folder, real `mail.py` subprocesses, and fakes for the desktop app's session store, the `open` command, running sessions with real inbox sockets, the command-line Claude, `osascript` and `launchctl`.
+
+```bash
+python3 tests/e2e_v4.py /tmp/claudemail-scratch
+```
+
+```bash
+python3 -B tests/report_clock.py
+```
+
+`tests/postman_reports.py` imports the separate Postman service and runs only where it sits beside ClaudeMail. `tests/timeout_expires.py` and `tests/signed_delivery.py` take the `mail.py` to test and a scratch folder (the second needs the Signed Commands verifier). `tests/inbox_probe.py` and `tests/windows_child_probe.py` are probes to run by hand on a real machine for the steps a sandbox cannot cover (the Windows named pipe, a child process under `pythonw`).
+
+From October on, changes to the live service were made the same way: each new check had to fail on a control copy of the previous code and pass on the candidate, and an independent reviewer read most diffs. The three large deploys of 2026-10-30 also ran as a canary on the live mailbox before the other machines took the file.
+
+## Limits and caveats
+
+- **Undocumented interfaces.** ClaudeMail reads `~/.claude/sessions/<pid>.json`, the desktop app's session store, and the app's log, and it uses the inbox socket and peer key of running sessions and the `claude://resume` link. These are how the Claude Code desktop app worked in October and November 2026, found by testing and by reading the app's code, not a published API.
+- **The app's process cap.** The desktop app runs at most `max(6, floor(memory / 3 GiB))` session processes and silently declines background starts beyond that. Mail for a session that cannot start waits, and the reason names the cap.
+- **Bypass-permissions sessions** hold messages from other sessions for approval, which the desktop app cannot show, so they don't receive mail.
+- **Resilio Sync is a slow message bus.** Median delivery between machines is about 13 seconds, but sync can lag for minutes and can split one way without notice; the reports' `seen` field exists to detect that. Any synced folder works the same way, with the same caveats.
+- **Message ids are unique per machine.** Give `status` and `--reply-to` a path, not a bare id.
+- **Stale installer comments.** The header of `install_launchd.sh` still describes version 3 (a Stop-hook waiter and a Post office session). What the script does is current: it runs `mail.py install-hook`, which registers only the version 4 hook, and installs the LaunchAgent.
+- **House assumptions.** Desk names follow the house's folder layout (`Services`, `Projects`, `Tools`, `yyMMdd ` date prefixes), the Mac installer uses the LaunchAgent label `com.goocy.claudemail`, and the delivered text points sessions at the house's guidance file and at LeaseResources, the house's job scheduler. Adjust these for your own setup.
+
+## Repository layout
+
+```
+mail.py                     the whole service: sending, the dispatcher, delivery, reports, hooks
+signed_mail.py              framing for signed commands (needs the separate Signed Commands verifier)
+config/defaults.json        settings shared by all machines
+install_launchd.sh          macOS: hook + LaunchAgent
+build_app.sh, launcher.c    macOS: the small signed launcher app the LaunchAgent runs
+ClaudeMail.app/             its bundle (Info.plist; the binary is built by build_app.sh)
+install_task.ps1            Windows: hook + scheduled task
+uninstall_task.ps1          Windows: removes them
+tests/                      sandbox suite, focused regression tests, and manual probes
+docs/DESIGN.md              the current design and why
+docs/HISTORY.md             how it got here, with lessons learned
+```
+
+Mail itself lives in `mail/<Machine>/desks/<Desk>/` inside the synced folder and is not part of the repository.
+
+## History
+
+The git history of this repository was reconstructed after the fact from the archived transcripts of the Claude Code sessions that wrote ClaudeMail, from Resilio Sync's archive of replaced files, and from the before-and-after copies kept for each deploy. Each commit holds the files as they were live at that moment, apart from a handful of strings scrubbed for privacy throughout the history (session ids, private project names, location hints), and carries the time they went live. Where a stretch of changes was made by shell scripts that the transcripts don't preserve, one commit holds the result and says so. [docs/HISTORY.md](docs/HISTORY.md) has the narrative.
+
+Every line of code was written by Claude Code sessions (Claude Opus) running on the house machines, directed, tested and reviewed in conversation with the user.
+
+## License
+
+MIT, see [LICENSE](LICENSE).

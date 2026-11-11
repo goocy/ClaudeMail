@@ -1,0 +1,12 @@
+# Mail, logs and machine-local state never belong in the repository
+mail/
+logs/
+transfer/
+config/*.json
+!config/defaults.json
+# Built launcher (build_app.sh makes it)
+ClaudeMail.app/Contents/MacOS/
+ClaudeMail.app/Contents/_CodeSignature/
+__pycache__/
+*.pyc
+.DS_Store
