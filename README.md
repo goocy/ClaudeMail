@@ -4,6 +4,8 @@ ClaudeMail lets Claude Code sessions on different computers send each other mail
 
 It runs in one household on eight machines (four Windows PCs, four Macs) and is carried by a folder that Resilio Sync keeps in step between them. It is plain Python (standard library only, one file of about 1,800 lines) plus small installers for macOS and Windows.
 
+> **Built for Claude Code Desktop, not the Claude Code CLI.** ClaudeMail delivers into sessions of the Claude Code desktop app (the Code tab of the Claude app on macOS and Windows). It lists sessions from the app's own session store, reopens them with the app's `claude://resume` link, and creates new ones that appear in the app's sidebar. Sessions started in a terminal with the standalone `claude` command are not in that store, so ClaudeMail can neither list nor reach them. It uses the command-line Claude that ships with the app only to create a new session before the app opens it.
+
 > **Status: personal infrastructure, published as it runs.** ClaudeMail works every day, but it was built for one house and leans on parts of the Claude Code desktop app that are not a public API (its session registry, the inbox socket of a running session, the `claude://resume` link, the app's session store). Any app update can break it. Read it as a worked example and a starting point, not as a supported product.
 
 ## Contents
@@ -28,20 +30,14 @@ The first version took six minutes to write. Making mail reliably reach the *rig
 
 ## How it works
 
-```
- machine A                                     synced folder                                    machine B
- ─────────                                     ─────────────                                    ─────────
- Claude session                                                                                 dispatcher (mail.py watch)
-   │ 1. mail.py sessions B ──── reads ───►  mail/B/reports/slot-N.json  ◄── writes on change ──┤   one per machine, started at logon
-   │    (B's sessions, their state, titles)                                                     │
-   │ 2. mail.py send --to B:Desk                                                                │ 3. sees the new file within seconds
-   │      --for-session 1a2b3c4d ─── writes ─►  mail/B/desks/<Desk>/<id>.md  ─── read by ────────┤
-   │                                                                                            │ 4. delivers into that session:
-   │                                                                                            │    running  → its inbox socket
-   │                                                                                            │    closed   → claude://resume, then socket
-   │                                                                                            │    new      → CLI "/rename <title>", resume, socket
-   │ 6. the reply arrives the same way  ◄──────────  mail/A/desks/<Desk>/<id>.md  ◄── 5. send --reply-to <path>
-```
+<p align="center"><img src="docs/images/how-it-works.svg" alt="Machine A's Claude session reads machine B's report from the synced folder (1) and writes a message onto B's desk (2); B's dispatcher picks it up within seconds (3) and delivers it into the target session (4), through its inbox socket, after reopening it with claude://resume, or after creating it; the reply goes back with --reply-to (5) and A's dispatcher hands it to the sending session (6)." width="100%"></p>
+
+1. The sending session runs `mail.py sessions B` and reads machine B's newest report from the synced folder.
+2. It runs `mail.py send`, which writes the message onto the receiving desk's folder, addressed to one session or to a new one.
+3. B's dispatcher sees the new file within seconds.
+4. It delivers the message into the target session: straight into its inbox socket if it runs, after reopening it with `claude://resume` if it is closed, or after creating it if it is new.
+5. The target session answers with `mail.py send --reply-to <path>`.
+6. A's dispatcher hands the reply to the session that sent the first message.
 
 **Sending takes two steps.** `mail.py sessions Machine[:Desk]` lists the desktop sessions on the other machine: id, whether they run (`idle`, `busy`) or are `closed`, last activity, title, and what the last turn did. It reads that machine's newest report, which the machine rewrites whenever its sessions change and at least every ten minutes. Then `mail.py send` addresses one of those sessions (`--for-session`, eight characters of the id are enough) or a new session (`--new --name "..."`, whose name becomes the sidebar title). A Claude session that names neither is refused and shown the list. Nothing on the receiving side ever guesses.
 
@@ -151,19 +147,18 @@ From October on, changes to the live service were made the same way: each new ch
 
 ## Repository layout
 
-```
-mail.py                     the whole service: sending, the dispatcher, delivery, reports, hooks
-signed_mail.py              framing for signed commands (needs the separate Signed Commands verifier)
-config/defaults.json        settings shared by all machines
-install_launchd.sh          macOS: hook + LaunchAgent
-build_app.sh, launcher.c    macOS: the small signed launcher app the LaunchAgent runs
-ClaudeMail.app/             its bundle (Info.plist; the binary is built by build_app.sh)
-install_task.ps1            Windows: hook + scheduled task
-uninstall_task.ps1          Windows: removes them
-tests/                      sandbox suite, focused regression tests, and manual probes
-docs/DESIGN.md              the current design and why
-docs/HISTORY.md             how it got here, with lessons learned
-```
+| Path | What it is |
+|---|---|
+| `mail.py` | The whole service: sending, the dispatcher, delivery, reports, hooks. |
+| `signed_mail.py` | Framing for signed commands (needs the separate Signed Commands verifier). |
+| `config/defaults.json` | Settings shared by all machines. |
+| `install_launchd.sh` | macOS: the hook and the LaunchAgent. |
+| `build_app.sh`, `launcher.c` | macOS: the small signed launcher app the LaunchAgent runs. |
+| `ClaudeMail.app/` | Its bundle (`Info.plist`; `build_app.sh` builds the binary). |
+| `install_task.ps1`, `uninstall_task.ps1` | Windows: the hook and the scheduled task, and their removal. |
+| `tests/` | The sandbox suite, focused regression tests, and manual probes. |
+| `docs/DESIGN.md` | The current design and the reasons for it. |
+| `docs/HISTORY.md` | How it got here, with lessons learned. |
 
 Mail itself lives in `mail/<Machine>/desks/<Desk>/` inside the synced folder and is not part of the repository.
 

@@ -1,0 +1,107 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1000 480" width="1000" height="480" role="img" aria-labelledby="title desc">
+  <title id="title">How a ClaudeMail message travels</title>
+  <desc id="desc">A Claude session on machine A reads machine B's report from the synced folder, writes a message onto B's desk, B's dispatcher picks it up and delivers it into the target session (through its inbox socket, after reopening it, or after creating it), and the reply comes back the same way.</desc>
+  <style>
+    .col { fill: #f6f8fa; stroke: #d0d7de; stroke-width: 1.5; }
+    .sync { fill: #f6f8fa; stroke: #8c959f; stroke-width: 1.5; stroke-dasharray: 6 5; }
+    .box { fill: #ffffff; stroke: #57606a; stroke-width: 1.5; }
+    .file { fill: #ddf4ff; stroke: #54aeff; stroke-width: 1.5; }
+    .target { fill: #dafbe1; stroke: #4ac26b; stroke-width: 1.5; }
+    .line { stroke: #57606a; stroke-width: 2; fill: none; }
+    .head { fill: #57606a; }
+    .num { fill: #0969da; }
+    .numtext { fill: #ffffff; font: 700 12px -apple-system, "Segoe UI", Helvetica, Arial, sans-serif; }
+    text { fill: #1f2328; font-family: -apple-system, "Segoe UI", Helvetica, Arial, sans-serif; }
+    .h { font-size: 16px; font-weight: 700; }
+    .t { font-size: 14px; font-weight: 600; }
+    .s { font-size: 12px; fill: #59636e; }
+    .lab { font-size: 12px; fill: #59636e; }
+    .mono { font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; font-size: 12.5px; }
+    @media (prefers-color-scheme: dark) {
+      .col { fill: #161b22; stroke: #30363d; }
+      .sync { fill: #161b22; stroke: #6e7681; }
+      .box { fill: #0d1117; stroke: #8b949e; }
+      .file { fill: #0c2d4b; stroke: #388bfd; }
+      .target { fill: #0f2e1b; stroke: #3fb950; }
+      .line { stroke: #8b949e; }
+      .head { fill: #8b949e; }
+      .num { fill: #388bfd; }
+      text { fill: #e6edf3; }
+      .s, .lab { fill: #9198a1; }
+    }
+  </style>
+  <defs>
+    <marker id="arrow" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse">
+      <path class="head" d="M0,0 L10,5 L0,10 z"/>
+    </marker>
+  </defs>
+
+  <!-- columns -->
+  <rect class="col" x="20" y="50" width="190" height="410" rx="12"/>
+  <rect class="sync" x="330" y="50" width="300" height="410" rx="12"/>
+  <rect class="col" x="760" y="50" width="220" height="410" rx="12"/>
+  <text class="h" x="115" y="35" text-anchor="middle">Machine A</text>
+  <text class="h" x="480" y="35" text-anchor="middle">Synced folder</text>
+  <text class="h" x="870" y="35" text-anchor="middle">Machine B</text>
+
+  <!-- machine A -->
+  <rect class="box" x="35" y="75" width="160" height="160" rx="8"/>
+  <text class="t" x="115" y="145" text-anchor="middle">Claude session</text>
+  <text class="s" x="115" y="165" text-anchor="middle">the sender</text>
+  <rect class="box" x="35" y="360" width="160" height="75" rx="8"/>
+  <text class="t" x="115" y="392" text-anchor="middle">Dispatcher A</text>
+  <text class="s" x="115" y="412" text-anchor="middle">hands the reply to</text>
+  <text class="s" x="115" y="427" text-anchor="middle">the sending session</text>
+
+  <!-- synced folder -->
+  <rect class="file" x="345" y="88" width="270" height="44" rx="6"/>
+  <text class="mono" x="480" y="115" text-anchor="middle">mail/B/reports/slot-N.json</text>
+  <rect class="file" x="345" y="188" width="270" height="44" rx="6"/>
+  <text class="mono" x="480" y="215" text-anchor="middle">mail/B/desks/&lt;Desk&gt;/&lt;id&gt;.md</text>
+  <rect class="file" x="345" y="373" width="270" height="44" rx="6"/>
+  <text class="mono" x="480" y="400" text-anchor="middle">mail/A/desks/&lt;Desk&gt;/&lt;id&gt;.md</text>
+  <text class="s" x="480" y="150" text-anchor="middle">B's sessions, desks and warnings</text>
+  <text class="s" x="480" y="250" text-anchor="middle">the message, addressed to one session</text>
+  <text class="s" x="480" y="435" text-anchor="middle">the reply</text>
+
+  <!-- machine B -->
+  <rect class="box" x="775" y="75" width="190" height="160" rx="8"/>
+  <text class="t" x="870" y="140" text-anchor="middle">Dispatcher B</text>
+  <text class="s" x="870" y="160" text-anchor="middle">mail.py watch, one per</text>
+  <text class="s" x="870" y="175" text-anchor="middle">machine, started at logon</text>
+  <rect class="target" x="775" y="300" width="190" height="140" rx="8"/>
+  <text class="t" x="870" y="327" text-anchor="middle">Target session</text>
+  <text class="s" x="790" y="355">running: its inbox socket</text>
+  <text class="s" x="790" y="375">closed: claude://resume,</text>
+  <text class="s" x="800" y="390">then the socket</text>
+  <text class="s" x="790" y="410">new: created with /rename,</text>
+  <text class="s" x="800" y="425">resumed, then the socket</text>
+
+  <!-- arrows -->
+  <line class="line" x1="775" y1="110" x2="617" y2="110" marker-end="url(#arrow)"/>
+  <text class="lab" x="696" y="100" text-anchor="middle">writes on change</text>
+
+  <line class="line" x1="345" y1="110" x2="197" y2="110" marker-end="url(#arrow)"/>
+  <circle class="num" cx="226" cy="95" r="9"/><text class="numtext" x="226" y="99" text-anchor="middle">1</text>
+  <text class="lab" x="282" y="99" text-anchor="middle">sessions B</text>
+
+  <line class="line" x1="195" y1="210" x2="343" y2="210" marker-end="url(#arrow)"/>
+  <circle class="num" cx="226" cy="195" r="9"/><text class="numtext" x="226" y="199" text-anchor="middle">2</text>
+  <text class="lab" x="270" y="199" text-anchor="middle">send</text>
+
+  <line class="line" x1="615" y1="210" x2="773" y2="210" marker-end="url(#arrow)"/>
+  <circle class="num" cx="646" cy="195" r="9"/><text class="numtext" x="646" y="199" text-anchor="middle">3</text>
+  <text class="lab" x="704" y="199" text-anchor="middle">within seconds</text>
+
+  <line class="line" x1="870" y1="235" x2="870" y2="298" marker-end="url(#arrow)"/>
+  <circle class="num" cx="890" cy="267" r="9"/><text class="numtext" x="890" y="271" text-anchor="middle">4</text>
+  <text class="lab" x="906" y="271">delivers</text>
+
+  <line class="line" x1="775" y1="395" x2="617" y2="395" marker-end="url(#arrow)"/>
+  <circle class="num" cx="744" cy="380" r="9"/><text class="numtext" x="744" y="384" text-anchor="middle">5</text>
+  <text class="lab" x="680" y="384" text-anchor="middle">--reply-to</text>
+
+  <line class="line" x1="345" y1="395" x2="197" y2="395" marker-end="url(#arrow)"/>
+  <circle class="num" cx="314" cy="380" r="9"/><text class="numtext" x="314" y="384" text-anchor="middle">6</text>
+  <text class="lab" x="256" y="384" text-anchor="middle">same way</text>
+</svg>
