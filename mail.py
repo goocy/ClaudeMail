@@ -3,7 +3,8 @@
 Version 4 (2026-10-26, Pulvermaar). The sender picks the receiving session, or asks for a new one; nothing on the
 receiving machine ever guesses. Design and reasons: README.md beside this file.
 
-    sessions [Machine[:Desk]]       what runs on a machine: each desktop session with its desk, state and title
+    sessions [Machine[:Desk] | all[:Desk]] [--running]
+                                    what runs on a machine: each desktop session with its desk, state and title
     send --to Machine[:Desk] (--for-session ID | --new --name TEXT) --subject TEXT --body-file FILE
     send --reply-to MESSAGE --body-file FILE        to the session that sent MESSAGE
 
@@ -11,8 +12,9 @@ A Claude session that sends to a new session proposes its name (--name), which b
 receiving machine's sidebar; a program may leave it out, and the app then titles the session itself.
 
 A desk is a project on a machine (Machine:Desk), derived from a session's folder: under ~/ResilioSync the first part
-below Services, Projects or Tools (the first part elsewhere), without a leading 'yyMMdd ' date stamp; a '.desk' file
-in the folder or a parent overrides that; everything outside the projects is the machine's Home desk. A desk is where
+below Services or Tools, below Projects the first date-stamped folder wherever it sits (grouping folders without a date
+stamp, such as the categories, done and failed, are passed over), the first part elsewhere; without its leading
+'yyMMdd ' date stamp; a '.desk' file in the folder or a parent overrides that (Projects/iOS Apps has one); everything outside the projects is the machine's Home desk. A desk is where
 mail lies on disk and the folder a new session for it starts in.
 
 On the receiving machine the dispatcher hands each message to its session:
@@ -72,6 +74,7 @@ DESK_FILE = ".desk"
 REPORTS = "reports"
 STATUS_SUFFIX = ".delivery.json"                                    # .status.json until v3: left alone
 GROUP_FOLDERS = ["Services", "Projects", "Tools"]
+PROJECTS = "Projects"                                               # its projects may sit below grouping folders
 HEADER_FIELDS = ["from", "from_session", "to", "for_session", "session_name", "subject", "sent", "id", "conversation",
                  "in_reply_to", "protocol", "expires_minutes"]
 HOOK_EVENTS = ["SessionStart", "UserPromptSubmit"]
@@ -131,11 +134,24 @@ def path_parts(folder: str) -> list:
     return [p for p in str(folder).replace(chr(92), "/").split("/") if p and p != "."]
 
 
+def is_date_stamped(name: str) -> bool:
+    """Whether a folder name starts with a 'yyMMdd ' date stamp: the house mark of a project folder (2026-11-25)."""
+    return len(name) > 7 and name[:6].isdigit() and name[6] == " "
+
+
 def drop_date_stamp(name: str) -> str:
     """'260926 LifeCoordinator' -> 'LifeCoordinator'."""
-    if len(name) > 7 and name[:6].isdigit() and name[6] == " ":
+    if is_date_stamped(name):
         return name[7:].strip()
     return name
+
+
+def project_part(below: list) -> str:
+    """The part of a path below Projects that names its desk: the first date-stamped folder, so that any number of
+    grouping folders without a date stamp (the categories, done, failed, iOS Apps) are passed over; a path with no
+    date-stamped folder is a grouping folder itself, named by its first part, as before the categories (2026-11-25)."""
+    assert below, "no part below Projects"
+    return next((part for part in below if is_date_stamped(part)), below[0])
 
 
 def clean_desk_name(name: str) -> str:
@@ -186,6 +202,8 @@ def desk_for(folder: str) -> str:
         below = parts[index + 1:]
         if not below:
             return HOME_DESK
+        if below[0].casefold() == PROJECTS.casefold():
+            return clean_desk_name(drop_date_stamp(project_part(below[1:]))) if len(below) > 1 else HOME_DESK
         if any(below[0].casefold() == group.casefold() for group in GROUP_FOLDERS):
             return clean_desk_name(drop_date_stamp(below[1])) if len(below) > 1 else HOME_DESK
         return clean_desk_name(drop_date_stamp(below[0]))
@@ -852,18 +870,29 @@ def print_sessions(machine: str, view: dict, desk=None) -> None:
 
 
 def cmd_sessions(args, config: dict) -> None:
-    if not args.target:
-        for machine in config["machines"]:
-            if machine == this_machine(config) or report_names(machine, config):
-                print_sessions(machine, machine_view(machine, config))
-        return
-    machine_part, _, desk_part = args.target.partition(":")
-    machine = canonical_machine(machine_part, config)
-    view = machine_view(machine, config)
-    desk = find_desk_name(desk_part, view["desks"]) if desk_part.strip() else None
-    if desk_part.strip() and desk is None:
-        raise SystemExit("No desk '" + desk_part.strip() + "' on " + machine + ". Its desks: " + ", ".join(sorted(view["desks"])))
-    print_sessions(machine, view, desk)
+    """One machine, or 'all' (also no target): every machine that has reported. With a desk, only that desk, on each
+    machine that has it. --running: only the sessions with a process (idle or busy) and the desks that have one, which
+    is what a session checks before it moves a project folder (2026-11-25)."""
+    machine_part, _, desk_part = (args.target or "all").partition(":")
+    every = machine_part.strip().casefold() == "all"
+    machines = ([m for m in config["machines"] if m == this_machine(config) or report_names(m, config)] if every
+                else [canonical_machine(machine_part, config)])
+    shown = 0
+    for machine in machines:
+        view = machine_view(machine, config)
+        if args.running:
+            running = [s for s in view["sessions"] if s["state"] != "closed"]
+            view = dict(view, sessions=running, desks={d: f for d, f in view["desks"].items() if any(s["desk"] == d for s in running)})
+        desk = find_desk_name(desk_part, view["desks"]) if desk_part.strip() else None
+        if desk_part.strip() and desk is None:
+            if not every and not args.running:
+                raise SystemExit("No desk '" + desk_part.strip() + "' on " + machine + ". Its desks: " + ", ".join(sorted(view["desks"])))
+            continue
+        print_sessions(machine, view, desk)
+        shown += 1
+    if not shown:
+        print("No " + ("running session on the " if args.running else "") + "desk '" + desk_part.strip() + "' on "
+              + ("any machine" if every else machines[0]) + ".")
 
 
 # ---------------------------------------------------------------- send
@@ -964,6 +993,9 @@ def resolve_recipients(args, config: dict, sender: str, sender_session: str) -> 
         view = machine_view(machine, config)
         desk = find_desk_name(desk_part or HOME_DESK, view["desks"])
         synced = tree_folders(desk_part.strip()) if desk is None and desk_part.strip() else []
+        if len(synced) > 1:
+            raise SystemExit("The desk '" + desk_part.strip() + "' is more than one folder of the synced tree ("
+                             + ", ".join(synced) + "), and none is picked; give the project a '.desk' file or rename one.")
         if len(synced) == 1:                                 # a project of the synced tree is a desk on every machine
             desk = desk_for(synced[0])
             view["desks"][desk] = synced[0]
@@ -1062,13 +1094,27 @@ def delivery_text(machine: str, desk: str, path: Path, text: str, config: dict, 
     return "\n\n".join(parts + [block])
 
 
+def project_folders(folder: Path) -> list:
+    """The folders below Projects that may be a desk's: every date-stamped folder, however many grouping folders
+    without a date stamp lie above it, and those grouping folders themselves; nothing inside a date-stamped one."""
+    found = []
+    for entry in os.scandir(folder):
+        if entry.is_dir():
+            found.append(Path(entry.path))
+            if not is_date_stamped(entry.name):
+                found += project_folders(Path(entry.path))
+    return found
+
+
 def tree_folders(desk: str) -> list:
-    """The folders in the synced tree that are this desk: below Services, Projects or Tools the folder whose name
-    without its date stamp is the desk, elsewhere in ~/ResilioSync the top folder of that name; each confirmed by
-    desk_for, so a '.desk' file that names another desk excludes it."""
+    """The folders in the synced tree that are this desk: below Services or Tools the folder whose name without its
+    date stamp is the desk, below Projects such a folder wherever it sits (project_folders), elsewhere in ~/ResilioSync
+    the top folder of that name; each confirmed by desk_for, so a '.desk' file that names another desk excludes it."""
     wanted = desk.casefold()
-    candidates = [SYNC_ROOT / group / name for group in GROUP_FOLDERS if (SYNC_ROOT / group).is_dir()
+    candidates = [SYNC_ROOT / group / name for group in GROUP_FOLDERS if group != PROJECTS and (SYNC_ROOT / group).is_dir()
                   for name in os.listdir(SYNC_ROOT / group) if drop_date_stamp(name).casefold() == wanted]
+    if (SYNC_ROOT / PROJECTS).is_dir():
+        candidates += [f for f in project_folders(SYNC_ROOT / PROJECTS) if drop_date_stamp(f.name).casefold() == wanted]
     if desk not in GROUP_FOLDERS:
         candidates.append(SYNC_ROOT / desk)
     return [str(c) for c in candidates if c.is_dir() and desk_for(str(c)).casefold() == wanted]
@@ -1806,7 +1852,8 @@ def main() -> None:
     p.add_argument("--signed", help="envelope file from signed_command.py sign; a --body-file becomes a note beside it")
     p.add_argument("--to-own-desk", action="store_true", help=argparse.SUPPRESS)   # LeaseResources passes it; no effect
     p = sub.add_parser("sessions", help="the sessions on a machine or desk, to pick the one a message is for")
-    p.add_argument("target", nargs="?", help="Machine or Machine:Desk; every machine when left out")
+    p.add_argument("target", nargs="?", help="Machine, Machine:Desk, all or all:Desk; every machine when left out")
+    p.add_argument("--running", action="store_true", help="only sessions with a process (idle or busy), and their desks")
     p = sub.add_parser("status")
     p.add_argument("message")
     p = sub.add_parser("inbox")

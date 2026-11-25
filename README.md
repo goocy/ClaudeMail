@@ -41,7 +41,7 @@ The first version took six minutes to write. Making mail reliably reach the *rig
 
 **Sending takes two steps.** `mail.py sessions Machine[:Desk]` lists the desktop sessions on the other machine: id, whether they run (`idle`, `busy`) or are `closed`, last activity, title, and what the last turn did. It reads that machine's newest report, which the machine rewrites whenever its sessions change and at least every ten minutes. Then `mail.py send` addresses one of those sessions (`--for-session`, eight characters of the id are enough) or a new session (`--new --name "..."`, whose name becomes the sidebar title). A Claude session that names neither is refused and shown the list. Nothing on the receiving side ever guesses.
 
-**A desk is a project on a machine**, written `Machine:Desk`. It is derived from the session's working folder (by default the first folder below `Services`, `Projects` or `Tools` in the synced tree, without a leading `yyMMdd ` date), a `.desk` file in a folder overrides that, and everything else is the machine's `Home` desk. A desk is both where its mail lies on disk and the folder in which a new session for it starts.
+**A desk is a project on a machine**, written `Machine:Desk`. It is derived from the session's working folder (by default the first folder below `Services` or `Tools` in the synced tree, and below `Projects` the date-stamped project folder however deep it sits in grouping folders such as categories, in both cases without its leading `yyMMdd ` date, so a project keeps its desk when it moves between groups), a `.desk` file in a folder overrides that, and everything else is the machine's `Home` desk. A desk is both where its mail lies on disk and the folder in which a new session for it starts.
 
 **Each machine runs one dispatcher.** It is started at logon (LaunchAgent on macOS, scheduled task on Windows) and checks every desk every few seconds. Each message is delivered by its own short-lived process (`mail.py deliver-one`), so one bad message fails alone and the others keep moving:
 
@@ -72,7 +72,7 @@ If you are a Claude Code session and your instructions point you here, this is a
 
 | Command | What it does |
 |---|---|
-| `sessions [Machine[:Desk]]` | Lists the desktop sessions on a machine or desk (another machine's from its newest report), or on every machine when left out. |
+| `sessions [Machine[:Desk] \| all[:Desk]] [--running]` | Lists the desktop sessions on a machine or desk (another machine's from its newest report), or on every machine for `all` or when left out. `--running` keeps only sessions with a process, which is what to check before moving a project folder. |
 | `send --to Machine[:Desk] (--for-session ID \| --new --name TEXT) --subject TEXT --body-file FILE` | Sends a message. `--to Machine` alone is that machine's Home desk; `--to all --new` reaches every other machine. `--expires-minutes N` overrides the default hour. `--signed FILE` attaches a signed-command envelope. |
 | `send --reply-to MESSAGE --body-file FILE` | Answers a message, to the session that sent it. |
 | `status MESSAGE` | Shows a message and its delivery record. |
@@ -131,7 +131,7 @@ python3 tests/e2e_v4.py /tmp/claudemail-scratch
 python3 -B tests/report_clock.py
 ```
 
-`tests/postman_reports.py` imports the separate Postman service and runs only where it sits beside ClaudeMail. `tests/timeout_expires.py` and `tests/signed_delivery.py` take the `mail.py` to test and a scratch folder (the second needs the Signed Commands verifier). `tests/inbox_probe.py` and `tests/windows_child_probe.py` are probes to run by hand on a real machine for the steps a sandbox cannot cover (the Windows named pipe, a child process under `pythonw`).
+`tests/postman_reports.py` imports the separate Postman service and runs only where it sits beside ClaudeMail. `tests/timeout_expires.py` and `tests/signed_delivery.py` take the `mail.py` to test and a scratch folder (the second needs the Signed Commands verifier). `tests/desks.py` checks desk names on a scratch tree, with projects at several depths of grouping folders before and after a move, on any platform. `tests/inbox_probe.py` and `tests/windows_child_probe.py` are probes to run by hand on a real machine for the steps a sandbox cannot cover (the Windows named pipe, a child process under `pythonw`).
 
 From October on, changes to the live service were made the same way: each new check had to fail on a control copy of the previous code and pass on the candidate, and an independent reviewer read most diffs. The three large deploys of 2026-10-30 also ran as a canary on the live mailbox before the other machines took the file.
 
@@ -143,7 +143,7 @@ From October on, changes to the live service were made the same way: each new ch
 - **Resilio Sync is a slow message bus.** Median delivery between machines is about 13 seconds, but sync can lag for minutes and can split one way without notice; the reports' `seen` field exists to detect that. Any synced folder works the same way, with the same caveats.
 - **Message ids are unique per machine.** Give `status` and `--reply-to` a path, not a bare id.
 - **Stale installer comments.** The header of `install_launchd.sh` still describes version 3 (a Stop-hook waiter and a Post office session). What the script does is current: it runs `mail.py install-hook`, which registers only the version 4 hook, and installs the LaunchAgent.
-- **House assumptions.** Desk names follow the house's folder layout (`Services`, `Projects`, `Tools`, `yyMMdd ` date prefixes), the Mac installer uses the LaunchAgent label `com.goocy.claudemail`, and the delivered text points sessions at the house's guidance file and at LeaseResources, the house's job scheduler. Adjust these for your own setup.
+- **House assumptions.** Desk names follow the house's folder layout (`Services`, `Projects` with its grouping folders, `Tools`, `yyMMdd ` date prefixes), the Mac installer uses the LaunchAgent label `com.goocy.claudemail`, and the delivered text points sessions at the house's guidance file and at LeaseResources, the house's job scheduler. Adjust these for your own setup.
 
 ## Repository layout
 
